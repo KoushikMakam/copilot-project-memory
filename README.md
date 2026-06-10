@@ -23,6 +23,7 @@ Every time you open Copilot CLI in a project folder, it **remembers everything**
 | 🔀 **Named Sessions** | Work on multiple features — switch context like branches |
 | 🌍 **Global Rules** | Personal defaults that apply across ALL projects |
 | 📊 **Auto-Learning** | Detects repeated corrections → suggests saving as rules |
+| 🔄 **Pipeline Executor** | Deterministic step-by-step task execution with verification |
 
 ### How It Works
 
@@ -190,6 +191,57 @@ Working on multiple features in the same project? Use named sessions — like br
 ```
 
 Auto-save writes to the **active named session** automatically. `:resume` picks up wherever you left off.
+
+#### Pipeline Executor (Deterministic Task Execution)
+
+Force Copilot to decompose, verify, and audit every step of complex tasks:
+
+```
+:pipeline <task>          — Run a task with verified step-by-step execution
+:pipeline resume          — Resume an interrupted pipeline
+:pipeline last            — Show last pipeline report
+:pipeline history         — Show all past pipeline runs
+:pipeline auto on|off     — Toggle auto-detection (default: on)
+:pipeline stop            — Disable pipeline mode
+```
+
+**How it works:**
+1. AI decomposes your task into atomic steps with pre/post checks
+2. Plan is saved to disk and shown as a visual workflow
+3. You approve, modify, or cancel before anything runs
+4. Each step executes with evidence-based verification
+5. A validator agent independently checks compliance against the approved plan
+
+Auto-activates for multi-step tasks (3+ steps) or trigger manually with `:pipeline`.
+
+```
+User: "Set up the dev environment"
+
+🔄 Pipeline mode activated
+
+═══ PIPELINE WORKFLOW ═══
+  ┌──────────┐     ┌──────────┐
+  │ 1. check  │     │ 2. clone │
+  │   python  │     │   repo   │
+  └────┬─────┘     └────┬─────┘
+       └──────┬─────────┘
+              ▼
+       ┌────────────┐
+       │ 3. install  │
+       └──────┬─────┘
+              ▼
+       ┌────────────┐
+       │ 4. test     │
+       └────────────┘
+  ⏳ Approve this plan?
+═══════════════════════
+
+After approval, each step runs with:
+  📋 PRE-CHECK  → ✅/❌ with evidence
+  🔨 EXECUTE    → actual work
+  📋 POST-CHECK → ✅/❌ with proof
+  📊 RESULT     → pass/fail
+```
 
 #### Team Sharing & Multi-Editor
 ```

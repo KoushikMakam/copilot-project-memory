@@ -103,6 +103,7 @@ When the user types `:help`, `:?`, or just `:`, show a quick reference:
   :stats               Cross-project stats
   :tracking            View auto-learned patterns
   :reset               Wipe project memory
+  :pipeline            Run task with verified step execution
   :help                Show this reference
 ```
 
@@ -457,7 +458,7 @@ The user types these as **regular chat messages** (not slash commands):
 
 **Recognition rules:**
 1. ONLY trigger memory operations when the message starts with a recognized `:command`
-2. Recognized commands: `:status`, `:resume`, `:remember`, `:forget`, `:rules`, `:prefs`, `:context`, `:extensions`, `:sessions`, `:session`, `:snippets`, `:export`, `:backup`, `:restore`, `:reset`, `:stats`, `:tracking`, `:compact`, `:verify`, `:help`, `:?`
+2. Recognized commands: `:status`, `:resume`, `:remember`, `:forget`, `:rules`, `:prefs`, `:context`, `:extensions`, `:sessions`, `:session`, `:snippets`, `:export`, `:backup`, `:restore`, `:reset`, `:stats`, `:tracking`, `:compact`, `:verify`, `:pipeline`, `:help`, `:?`
 3. Without the `:` prefix, treat "remember", "forget", "rules", etc. as normal conversation
 4. The prefix is case-insensitive: `:Status`, `:REMEMBER`, `:Rules` all work
 5. If the message doesn't start with a recognized `:command`, do NOT trigger any memory operation
@@ -486,6 +487,7 @@ The user types these as **regular chat messages** (not slash commands):
   :backup       — Backup all memory
   :stats        — Stats across all projects
   :tracking     — View auto-learned patterns
+  :pipeline     — Run task with verified step execution
   :reset        — Wipe project memory
 ```
 
@@ -836,5 +838,507 @@ When the user types `:rules touch <id>`:
 This prevents `:compact` from flagging actively-wanted rules as stale when they haven't been triggered organically.
 
 ---
+
+<!-- PIPELINE EXECUTOR PROTOCOL — Integrated with Project Memory -->
+
+## 🔄 Pipeline Executor Protocol
+
+You have a built-in execution protocol for multi-step tasks. This ensures **every step is decomposed,
+verified, and audited** — no steps are silently skipped.
+
+### When to Activate Pipeline Mode
+
+**Automatic activation** — enter pipeline mode when the task matches ANY of these concrete rules:
+
+**Rule 1: Keyword triggers** — user message contains ANY of these words/phrases:
+  - "set up", "setup", "install and configure", "bootstrap"
+  - "deploy", "deployment", "release"
+  - "migrate", "migration"
+  - "configure", "configuration"
+  - "follow the steps", "follow the guide", "follow the doc", "follow the runbook"
+  - "do everything in", "run all the steps"
+  - "pipeline", "run the pipeline"
+  - "onboard", "onboarding"
+
+**Rule 2: Multi-file edits** — task explicitly requires changing **3+ files**
+
+**Rule 3: Explicit sequencing** — user describes steps with ordering words:
+  - "first... then... after that..."
+  - "step 1, step 2, step 3"
+  - numbered lists with 3+ items
+
+**Rule 4: References documentation** — user points to a doc/guide to follow:
+  - "follow docs/deploy.md"
+  - "use the README instructions"
+  - "do what the runbook says"
+
+**Manual activation** — user types `:pipeline` or `:pipeline <description>`
+
+**When NOT to activate:**
+- Simple questions ("What does this function do?")
+- Single-file edits ("Fix the bug in auth.ts")
+- Code review or explanation tasks
+- Conversational responses
+- Tasks with only 1-2 independent steps
+
+When activating automatically, announce it and explain why:
+```
+🔄 Pipeline mode activated (reason: task contains "set up" + multi-step)
+   I'll decompose this into verified steps for your approval.
+```
+
+The user can configure auto-detection via preferences:
+```
+:prefs set pipeline.auto_detect true       # enable (default)
+:prefs set pipeline.auto_detect false      # disable — only :pipeline triggers
+:prefs set pipeline.min_steps 3            # minimum steps to auto-activate
+```
+
+---
+
+### The Protocol (MANDATORY when active)
+
+When pipeline mode is active, you MUST follow this exact sequence. No exceptions.
+
+#### Phase 1: DECOMPOSE
+
+Break the task into the smallest possible atomic steps. Output:
+
+```
+═══ PIPELINE PLAN ═══
+Task: <what the user asked>
+Steps: <N>
+
+  1. [step-id] — Description
+     Depends on: (none | step-ids)
+     Pre-check: what must be true before starting
+     Post-check: how to verify it worked
+
+  2. [step-id] — Description
+     Depends on: [step-1]
+     Pre-check: step-1 completed
+     Post-check: expected outcome
+
+  ...
+═══════════════════
+```
+
+**Rules for decomposition:**
+- Each step MUST have a single, clear action
+- Each step MUST have at least one post-check (how do we know it worked?)
+- Dependencies MUST be explicit
+- If a step is optional, mark it: `(optional)`
+- If a step can be retried, note it: `(retry: 3x)`
+
+#### Phase 1b: STORE & APPROVE (the plan becomes a contract)
+
+After decomposition, you MUST:
+
+**1. Save the plan to project memory** as a YAML file:
+
+Write to `~/.copilot/project-memory/<project>/pipelines/active-plan.yaml`:
+
+```yaml
+task: "Set up dev environment"
+created_at: "2026-06-10T17:30:00Z"
+status: "pending_approval"
+steps:
+  - id: check-python
+    description: "Verify Python is installed"
+    action: "python --version"
+    depends_on: []
+    prechecks: []
+    postchecks:
+      - "exit code 0"
+    optional: false
+
+  - id: install-deps
+    description: "Install project dependencies"
+    action: "pip install -r requirements.txt"
+    depends_on: [check-python]
+    prechecks:
+      - "requirements.txt exists"
+    postchecks:
+      - "exit code 0"
+      - "packages installed successfully"
+    optional: false
+
+  # ... all steps
+```
+
+**2. Show the workflow visually** to the user:
+
+```
+═══ PIPELINE WORKFLOW ═══
+Task: Set up dev environment
+
+  ┌─────────────────┐
+  │ 1. check-python  │
+  │ python --version │
+  └────────┬────────┘
+           ▼
+  ┌──────────────────┐     ┌──────────────────┐
+  │ 2. install-deps   │     │ 3. create-env     │
+  │ pip install ...   │     │ (optional)        │
+  └────────┬─────────┘     └────────┬─────────┘
+           └────────┬───────────────┘
+                    ▼
+           ┌──────────────────┐
+           │ 4. run-tests      │
+           │ pytest tests/     │
+           └──────────────────┘
+
+  Steps: 4 (1 optional)
+  Saved to: pipelines/active-plan.yaml
+
+═══════════════════════════
+
+⏳ Awaiting approval — proceed with this plan?
+```
+
+**3. ASK for approval** using the `ask_user` tool:
+
+```
+choices:
+  - "✅ Approve — run this plan"
+  - "✏️ Modify — I want to change some steps"
+  - "❌ Cancel — don't run this"
+```
+
+**On approval responses:**
+- **Approve** → update `status: "approved"` in the YAML file, proceed to Phase 2
+- **Modify** → ask what to change, update the plan YAML, re-show workflow, re-ask
+- **Cancel** → update `status: "cancelled"`, stop pipeline
+
+**4. WHY this matters:**
+
+The saved YAML file is the **source of truth** — not the AI's context window.
+During Phase 2 (EXECUTE), you MUST:
+- **Re-read** `pipelines/active-plan.yaml` before starting execution
+- Execute steps **in the exact order defined in the file**
+- Check off each step against the file — no additions, no removals, no reordering
+- If a step was in the approved plan, it MUST be executed
+- If a step was NOT in the approved plan, it MUST NOT be executed
+
+This turns the AI's execution from "memory-based" to "file-based":
+```
+❌ Without stored plan: AI works from its context (lossy, can forget steps)
+✅ With stored plan:    AI reads each step from disk (persistent, exact)
+```
+
+#### Phase 2: EXECUTE (one step at a time, reading from the stored plan)
+
+**Before starting execution:**
+1. Re-read `pipelines/active-plan.yaml` from project memory
+2. Verify `status: "approved"` — do NOT execute unapproved plans
+3. Update `status: "running"` in the file
+4. Execute steps in the EXACT order defined in the file
+
+For EACH step in the stored plan, output this EXACT structure:
+
+```
+━━━ STEP [N/total]: [step-id] ━━━
+
+📋 PRE-CHECK:
+  ✅ condition 1 (evidence: <what you checked>)
+  ✅ condition 2 (evidence: <what you found>)
+  — OR —
+  ❌ condition 1 (evidence: <why it failed>) → STOPPING
+
+🔨 EXECUTE:
+  <do the actual work — run commands, edit files, etc.>
+
+📋 POST-CHECK:
+  ✅ condition 1 (evidence: <proof it worked>)
+  ✅ condition 2 (evidence: <proof it worked>)
+  — OR —
+  ❌ condition 1 (evidence: <why it failed>) → STOPPING
+
+📊 RESULT: ✅ PASSED | ❌ FAILED | ⏭️ SKIPPED (optional step)
+```
+
+**Execution rules:**
+1. **NEVER skip a step.** Every step in the stored plan MUST appear in the output.
+2. **NEVER proceed to step N+1 if step N failed**, unless it's marked optional.
+3. **ALWAYS show evidence** — file paths, command output, exit codes. Not "I think it worked."
+4. **If a pre-check fails on a required step**, STOP the pipeline immediately.
+5. **If a post-check fails**, STOP and report what went wrong.
+6. **Use real tool calls** for verification — actually run commands, check files, read output.
+7. **Update the plan file** after each step completes — mark the step status in `active-plan.yaml`:
+   ```yaml
+   steps:
+     - id: check-python
+       status: completed        # ← updated after execution
+       evidence: "Python 3.11.9"
+     - id: install-deps
+       status: running          # ← currently executing
+   ```
+   This means if the session crashes mid-pipeline, the plan file shows exactly where it stopped.
+   On `:pipeline resume`, you can pick up from the last incomplete step.
+8. **Cross-check against the plan:** After executing all steps, compare the step IDs you executed
+   against the step IDs in `active-plan.yaml`. If ANY planned step was not executed, flag it.
+
+**What counts as valid evidence:**
+```
+✅ Good evidence (deterministic, verifiable):
+  - "File exists: src/config.ts (verified with ls)"
+  - "Command exited with code 0: npm test"
+  - "Output contains: 'All 42 tests passed'"
+  - "Directory created: dist/ (3 files)"
+
+❌ Bad evidence (not verifiable):
+  - "I believe this worked"
+  - "This should be fine"
+  - "Done"
+  - "The file was probably created"
+```
+
+#### Phase 3: REPORT
+
+After ALL steps complete (or pipeline stops on failure):
+
+**1. Update the plan file** with final status:
+```yaml
+status: "completed"  # or "failed" or "partial"
+completed_at: "2026-06-10T17:45:00Z"
+```
+
+**2. Archive the plan**: Copy `active-plan.yaml` to `pipelines/<timestamp>-<task-slug>.yaml`
+   so it's preserved in history. Clear `active-plan.yaml`.
+
+**3. Output the summary:**
+
+```
+═══ PIPELINE REPORT ═══
+
+Task: <original task>
+Status: ✅ PASSED | ❌ FAILED at step [id] | ⚠️ PARTIAL (N/M steps)
+
+  Step                    Status     Pre    Post   Evidence
+  ─────────────────────────────────────────────────────────
+  check-node              ✅ PASS    1/1    1/1    node v20.11.0
+  install-deps            ✅ PASS    1/1    1/1    node_modules/ (1247 pkgs)
+  run-tests               ✅ PASS    1/1    2/2    42 tests passing
+  build                   ❌ FAIL    1/1    0/1    dist/ not created
+  deploy                  🚫 BLOCKED  —      —     blocked by: build
+  ─────────────────────────────────────────────────────────
+  Total: 5 steps | ✅ 3 passed | ❌ 1 failed | 🚫 1 blocked
+
+═══════════════════════
+```
+
+#### Phase 4: VALIDATE (automatic — like rubber-duck for pipelines)
+
+**After completing Phase 3 (REPORT), you MUST run a validation pass.** This is NOT optional.
+This works exactly like the rubber-duck agent — a separate, independent review of your own work.
+
+**How to validate:**
+Call the **rubber-duck agent** (via the `task` tool with `agent_type: "rubber-duck"`) with this prompt:
+
+```
+Review this pipeline execution for protocol compliance.
+
+STORED PLAN FILE (source of truth — read from pipelines/active-plan.yaml):
+<paste the full YAML plan that was approved by the user>
+
+PIPELINE EXECUTION output:
+<paste the full Phase 2 output>
+
+PIPELINE REPORT:
+<paste the Phase 3 report>
+
+COMPLIANCE CHECKLIST — answer each with ✅ or ❌:
+1. Was the task decomposed into atomic steps?
+2. Does every step have at least one post-check?
+3. Were ALL steps from the STORED PLAN executed (compare step IDs 1:1)?
+4. Does every check have real, verifiable evidence (not "I think" or "should work")?
+5. Did execution stop on failures (unless step was optional)?
+6. Is the final report accurate and complete?
+7. Were dependencies respected (no step ran before its deps)?
+8. Are there steps that SHOULD have been in the plan but are missing?
+9. Does the execution match the APPROVED plan exactly (no added/removed/reordered steps)?
+
+For any ❌, specify:
+- What was missed
+- What needs to be redone
+```
+
+**After receiving validation results:**
+
+- If ALL items are ✅ → proceed, pipeline is complete
+- If ANY item is ❌ → you MUST fix the gaps:
+  1. Show the user what the validator found
+  2. Execute the missing/failed steps using the same Phase 2 format
+  3. Re-run Phase 3 (updated REPORT)
+  4. DO NOT re-validate (avoid infinite loops) — one validation pass is sufficient
+
+**Example validator output:**
+```
+═══ PIPELINE VALIDATION ═══
+
+  1. Task decomposed?           ✅
+  2. Post-checks on all steps?  ✅
+  3. No steps skipped?          ❌ Step "run-lint" was in plan but not executed
+  4. Real evidence?             ✅
+  5. Stopped on failure?        ✅
+  6. Report accurate?           ❌ Report shows 5/5 but step 3 was skipped
+  7. Dependencies respected?    ✅
+  8. Missing steps?             ❌ No database migration step — task mentioned DB changes
+  9. Matches approved plan?     ❌ Step "run-lint" in plan but missing from execution
+
+  Verdict: ❌ FAILED — 3 issues found
+  Action required: Execute "run-lint", add "db-migrate" step, update report
+
+═══════════════════════════
+```
+
+**Why this works:**
+- The validator is a SEPARATE agent call (structural, like rubber-duck)
+- It independently reviews the execution — catches blind spots
+- It checks against the STORED PLAN FILE, not just the output — detects skipped steps
+- The main agent MUST act on findings — not just acknowledge them
+- Combined with the structured format, this gives ~95% compliance
+
+---
+
+### :pipeline Command
+
+| User Types | What To Do |
+|-----------|------------|
+| `:pipeline` | Show pipeline mode status and usage help |
+| `:pipeline <task>` | Activate pipeline mode and start executing the task |
+| `:pipeline resume` | Resume an interrupted pipeline from the last incomplete step |
+| `:pipeline stop` | Deactivate pipeline mode for the rest of the session |
+| `:pipeline last` | Show the last pipeline report from the current session |
+| `:pipeline history` | Show all past pipeline runs for this project |
+| `:pipeline auto on` | Enable auto-detection (default) |
+| `:pipeline auto off` | Disable auto-detection — only manual `:pipeline` triggers it |
+
+When user types `:pipeline` with no arguments, show:
+```
+🔄 Pipeline Executor — Deterministic Step Execution
+
+  :pipeline <task>       Run a task in pipeline mode
+  :pipeline resume       Resume an interrupted pipeline
+  :pipeline stop         Disable pipeline mode
+  :pipeline last         Show last pipeline report
+  :pipeline history      Show all past runs
+  :pipeline auto on|off  Toggle auto-detection (currently: on)
+
+  Pipeline mode ensures every step is:
+    ✅ Decomposed into atomic steps
+    ✅ Saved to disk as a plan file (source of truth)
+    ✅ Approved by user before execution
+    ✅ Pre-checked before execution
+    ✅ Post-checked with evidence
+    ✅ Validated by independent agent (like rubber-duck)
+    ✅ Audited in your session history
+
+  Auto-activates for multi-step tasks (3+ steps).
+  Say ":pipeline <task>" to manually trigger.
+```
+
+---
+
+### Pipeline Integration with Project Memory
+
+#### Directory Structure Update
+
+```
+~/.copilot/project-memory/<project>/
+  ├── ...existing files...
+  ├── tracking.yml        # Updated: includes pipeline tracking
+  └── pipelines/          # NEW: pipeline plans and history
+      ├── active-plan.yaml         # Currently running/pending plan
+      └── <timestamp>-<slug>.yaml  # Archived completed plans
+```
+
+#### Session Auto-Save Integration
+
+When a pipeline completes, include the report in the session JSON:
+
+```json
+{
+  "sessionId": "<uuid>",
+  "summary": "Ran pipeline: Deploy Service — 5/5 steps passed",
+  "pipelines": [
+    {
+      "task": "Deploy Node.js Service",
+      "status": "passed",
+      "steps_total": 5,
+      "steps_passed": 5,
+      "steps": [
+        { "id": "check-node", "status": "passed", "evidence": "node v20.11.0" }
+      ]
+    }
+  ]
+}
+```
+
+#### Tracking Integration
+
+Track pipeline usage in `tracking.yml` under `pipeline:`:
+
+```yaml
+pipeline:
+  total_runs: 12
+  pass_rate: 0.83
+  avg_steps: 6
+  common_failures:
+    - step_pattern: "install-deps"
+      failure_count: 3
+      common_cause: "network timeout"
+      resolution: "retry with --prefer-offline"
+  last_run: "2026-06-10T17:00:00Z"
+```
+
+After 3+ pipeline runs, if a step pattern fails repeatedly, suggest:
+```
+💡 I've noticed "install-deps" fails frequently (3 times).
+Last fix: "retry with --prefer-offline". Want me to remember this as a rule?
+```
+
+#### Rules Integration
+
+Pipeline mode respects project rules. For example:
+- Rule: "Always run lint before commit" → pipeline auto-includes a lint step
+- Rule: "Never deploy without tests passing" → pipeline adds test as a dependency of deploy
+- Rule: "Use pnpm instead of npm" → pipeline uses pnpm commands
+
+#### Preferences
+
+Users can customize pipeline behavior via `:prefs`:
+
+```yaml
+pipeline:
+  auto_detect: true          # Auto-activate for multi-step tasks (default: true)
+  min_steps_to_activate: 3   # Minimum steps to auto-activate (default: 3)
+  fail_fast: true            # Stop on first failure (default: true)
+  show_evidence: true        # Always show evidence (default: true)
+  save_to_session: true      # Save pipeline reports to session (default: true)
+```
+
+Set via: `:prefs set pipeline.auto_detect false`
+
+### Why This Is More Reliable Than Generic Instructions
+
+The pipeline protocol has **three enforcement layers** that generic instructions lack:
+
+1. **Stored plan file** — Steps live on disk, not in AI's context window. The AI reads
+   each step from `active-plan.yaml`, so it can't "forget" steps. If the session crashes,
+   the file shows exactly where it stopped.
+
+2. **User approval gate** — The user reviews and approves the plan before anything runs.
+   The approved plan becomes a contract. No execution without explicit approval.
+
+3. **Validator agent** — A separate rubber-duck agent independently compares the execution
+   against the stored plan file. Catches skipped steps, fake evidence, and missing work.
+   The main agent must fix any gaps found.
+
+> Not 100% guaranteed — prompts are probabilistic. But non-compliance becomes **obvious**
+> rather than **silent**. That's the key shift: from "hope the AI followed all steps" to
+> "I can see and verify whether it did."
+
+<!-- END PIPELINE EXECUTOR PROTOCOL -->
 
 <!-- END PROJECT MEMORY SKILL -->
