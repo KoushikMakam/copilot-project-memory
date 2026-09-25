@@ -209,6 +209,55 @@ Working on multiple features in the same project? Use named sessions — like br
 
 Auto-save writes to the **active named session** automatically. `:resume` picks up wherever you left off.
 
+#### Layering Sessions (Stacks — build rich, cross-repo context)
+
+Want context to **build on top of context**? A *stack* is a named, ordered chained list of
+sessions layered together — pick and choose exactly which ones. Stacks are **composable and
+cross-repo**: a stack entry can reference *another stack* (a chained list in its own right)
+or a session *in another repo*, so one "multi-repo session" pulls it all together.
+
+**Reference grammar** (each entry, base → top):
+
+| Ref | Means |
+|-----|-------|
+| `sessionId` | a session in the current repo |
+| `@stackName` | another stack (chained list), inlined recursively — project or global |
+| `repo/sessionId` | a session in another repo's memory |
+| `repo/@stackName` | another repo's stack, inlined |
+
+```
+:stack save common auth api db        — Save an ordered chain (base first → top last)
+:stack add common perf                — Append another layer
+:stacks                               — List project + global stacks
+:sessions                             — List session IDs (so you know what to reference)
+:stack common                         — Load the layered context into the conversation
+:layer auth api                       — Ad-hoc: layer sessions on the fly, no save
+:stack apply common                   — Materialize the stack as one merged session
+:stack rm common auth                 — Remove a layer (or the whole stack if no ids)
+```
+
+Don't know a session's ID? List them (the output prints the exact ref to copy):
+
+```
+copilot-memory session list                 — Sessions in the current repo
+copilot-memory session list --repo other     — Sessions in another repo (repo/<id> refs)
+copilot-memory session list --all-repos       — Every repo's sessions
+```
+
+**Cross-repo / multi-repo** — save a stack in the global catalog (`_global`) so it's
+reachable from any repo, and reference sessions/stacks that live elsewhere:
+
+```
+copilot-memory session stack save mono repoA/auth repoB/@ingest --global
+copilot-memory session stack show --stack mono          — Layers across repoA + repoB
+copilot-memory session stack save big @mono extra-sid   — Nest @mono inside another stack
+```
+
+Ordering is **base → top**: later layers win on conflicts (treated as most recent).
+Resolution is **recursive with cycle detection**, and the assembled view is **deduped and
+token-capped**, so layering many sessions across repos stays cheap. Under the hood:
+`copilot-memory session stack {save,add,list,show,apply,rm}` (`--global` targets `_global`).
+
 #### Merging Sessions (Combine Multiple Contexts)
 
 Have context spread across several past sessions and want to start fresh work that pulls from all of them? Merge them into one:
@@ -440,6 +489,8 @@ tools/
 ### copilot-memory CLI (New in v2)
 
 Deterministic memory management — the AI calls this for complex operations:
+
+> 💡 **Short aliases:** `cmem` and `cm` are installed as drop-in aliases for `copilot-memory` (e.g. `cm status`, `cmem session stack list`).
 
 ```bash
 copilot-memory status              # Show project memory overview
