@@ -23,6 +23,8 @@ from copilot_memory.models import (
     Rule,
     RulesFile,
     SessionEntry,
+    Stack,
+    StacksFile,
 )
 
 
@@ -490,6 +492,308 @@ def merge_sessions(
     target_path = target_dir / f"{new_session_id}.json"
     _write_json(target_path, merged.model_dump())
 
+    save_latest_session(project_dir, LatestSession(
+        lastSessionId=new_session_id,
+        lastUpdatedAt=now_iso_str,
+        activeSession=into_name,
+    ))
+    return merged, target_path
+
+
+# ---------------------------------------------------------------------------
+# Stacks — named, ordered chains of sessions layered for rich context
+# ---------------------------------------------------------------------------
+
+def _stacks_path(project_dir: Path) -> Path:
+    return project_dir / "stacks.yml"
+
+
+def load_stacks(project_dir: Path) -> StacksFile:
+    """Load stacks.yml (returns an empty catalog if absent/malformed)."""
+    raw = _read_yaml(_stacks_path(project_dir))
+    if not raw:
+        return StacksFile()
+    try:
+        return StacksFile(**raw)
+    except Exception:
+        return StacksFile()
+
+
+def save_stacks(project_dir: Path, stacks_file: StacksFile) -> None:
+    """Persist stacks.yml atomically."""
+    _write_yaml(_stacks_path(project_dir), stacks_file.model_dump())
+
+
+def find_stack(stacks_file: StacksFile, name: str) -> Optional[Stack]:
+    for s in stacks_file.stacks:
+        if s.name == name:
+            return s
+    return None
+
+
+def load_global_stacks() -> StacksFile:
+    """Load the global (cross-repo) stacks catalog at _global/stacks.yml."""
+    return load_stacks(GLOBAL_DIR)
+
+
+def find_project_dir_by_name(name: str) -> Optional[Path]:
+    """Resolve a repo/project reference to its memory dir.
+
+    Matches an exact folder name, a slugged name, or a `<slug>-<hash>` prefix
+    (the shape `init` creates). Also matches the `_global` catalog.
+    """
+    if not MEMORY_ROOT.exists():
+        return None
+    exact = MEMORY_ROOT / name
+    if exact.exists() and exact.is_dir():
+        return exact
+    slug = make_project_slug(name)
+    candidates = []
+    for d in MEMORY_ROOT.iterdir():
+        if not d.is_dir():
+            continue
+        if d.name == name or d.name == slug:
+            return d
+        if d.name.startswith(name + "-") or d.name.startswith(slug + "-"):
+            candidates.append(d)
+    return candidates[0] if candidates else None
+
+
+# Guard against cyclic / runaway nested stack references.
+MAX_STACK_DEPTH = 12
+
+
+def resolve_stack_refs(
+    refs: list[str],
+    project_dir: Path,
+    _seen: Optional[set] = None,
+    _depth: int = 0,
+) -> list[tuple[Path, str]]:
+    """Expand stack references into an ordered list of (owner_dir, session_id).
+
+    Reference grammar (base → top ordering preserved):
+      - `sessionId`            → a session in `project_dir`
+      - `@stackName`           → another stack in `project_dir` (or global), inlined
+      - `repo/sessionId`       → a session in another repo's memory
+      - `repo/@stackName`      → another repo's stack, inlined
+    Nested stacks resolve recursively with cycle detection and a depth cap.
+    """
+    if _depth > MAX_STACK_DEPTH:
+        raise ValueError("stack reference too deep (possible cycle)")
+    seen = _seen if _seen is not None else set()
+    pairs: list[tuple[Path, str]] = []
+    for ref in refs:
+        owner = project_dir
+        rest = ref
+        if "/" in ref:
+            repo_name, rest = ref.split("/", 1)
+            resolved = find_project_dir_by_name(repo_name)
+            if resolved is None:
+                raise ValueError(f"Unknown repo '{repo_name}' in reference '{ref}'")
+            owner = resolved
+        if rest.startswith("@"):
+            stack_name = rest[1:]
+            key = (str(owner.resolve()), stack_name)
+            if key in seen:
+                raise ValueError(f"Cyclic stack reference: '{ref}'")
+            seen.add(key)
+            stack = find_stack(load_stacks(owner), stack_name)
+            if stack is None:
+                stack = find_stack(load_global_stacks(), stack_name)
+            if stack is None:
+                raise ValueError(f"Unknown stack '@{stack_name}'"
+                                 + (f" in repo '{owner.name}'" if owner != project_dir else ""))
+            pairs.extend(resolve_stack_refs(stack.sessions, owner, seen, _depth + 1))
+        else:
+            pairs.append((owner, rest))
+    return pairs
+
+
+def resolve_stack_entries(
+    project_dir: Path,
+    refs: list[str],
+) -> list[tuple[Path, SessionEntry]]:
+    """Resolve refs (incl. nested/cross-repo) to loaded (owner_dir, SessionEntry) layers."""
+    pairs = resolve_stack_refs(refs, project_dir)
+    layers: list[tuple[Path, SessionEntry]] = []
+    missing: list[str] = []
+    for owner, sid in pairs:
+        path = find_session_file(owner, sid)
+        entry = load_session(path) if path else None
+        if not entry:
+            label = sid if owner == project_dir else f"{owner.name}/{sid}"
+            missing.append(label)
+        else:
+            layers.append((owner, entry))
+    if missing:
+        raise ValueError(f"Unknown session ID(s): {', '.join(missing)}")
+    if not layers:
+        raise ValueError("stack requires at least one resolvable session")
+    return layers
+
+
+def upsert_stack(
+    project_dir: Path,
+    name: str,
+    sessions: list[str],
+    now_iso_str: str,
+    description: str = "",
+    append: bool = False,
+    catalog_dir: Optional[Path] = None,
+) -> Stack:
+    """Create or update a named stack. When append, add to the existing chain.
+
+    `catalog_dir` selects where the stack is stored (defaults to `project_dir`;
+    pass GLOBAL_DIR for a cross-repo/global stack).
+    """
+    target = catalog_dir or project_dir
+    stacks_file = load_stacks(target)
+    existing = find_stack(stacks_file, name)
+    if existing:
+        if append:
+            existing.sessions = _dedupe_preserve_order(existing.sessions + sessions)
+        else:
+            existing.sessions = _dedupe_preserve_order(sessions)
+        if description:
+            existing.description = description
+        existing.updated_at = now_iso_str
+        result = existing
+    else:
+        result = Stack(
+            name=name,
+            sessions=_dedupe_preserve_order(sessions),
+            description=description,
+            created_at=now_iso_str,
+            updated_at=now_iso_str,
+        )
+        stacks_file.stacks.append(result)
+    save_stacks(target, stacks_file)
+    return result
+
+
+def remove_from_stack(
+    project_dir: Path,
+    name: str,
+    sessions: Optional[list[str]],
+    now_iso_str: str,
+    catalog_dir: Optional[Path] = None,
+) -> Optional[Stack]:
+    """Remove sessions from a stack, or delete the whole stack when sessions is falsy.
+
+    Returns the updated Stack, or None when the entire stack was deleted.
+    Raises KeyError when the stack does not exist.
+    """
+    target = catalog_dir or project_dir
+    stacks_file = load_stacks(target)
+    existing = find_stack(stacks_file, name)
+    if not existing:
+        raise KeyError(name)
+    if not sessions:
+        stacks_file.stacks = [s for s in stacks_file.stacks if s.name != name]
+        save_stacks(target, stacks_file)
+        return None
+    drop = set(sessions)
+    existing.sessions = [s for s in existing.sessions if s not in drop]
+    existing.updated_at = now_iso_str
+    save_stacks(target, stacks_file)
+    return existing
+
+
+# Caps for an assembled layered context — keep reload token cost bounded.
+STACK_VERBATIM_DECISIONS = 12
+STACK_VERBATIM_LEARNINGS = 12
+STACK_VERBATIM_FILES = 25
+
+
+def assemble_stack(
+    project_dir: Path,
+    session_ids: list[str],
+) -> tuple[str, dict]:
+    """Layer N sessions (incl. nested/cross-repo refs) into one rich context view.
+
+    Deterministic, no LLM. References may be raw session IDs, `@stack` names,
+    or cross-repo `repo/session` / `repo/@stack` — resolved recursively to an
+    ordered base→top layer list. Later layers win on conflicts: the merged top
+    section is deduped keeping the topmost occurrence. Returns (rendered_text,
+    structured_dict). Raises ValueError if any reference cannot be resolved.
+    """
+    resolved = resolve_stack_entries(project_dir, session_ids)
+    layers = [entry for _, entry in resolved]
+    owners = [owner for owner, _ in resolved]
+
+    # Top-of-stack wins: iterate top→base, keep first occurrence, then reverse
+    # so the rendered order stays base→top with newest info retained.
+    def _merge_top_wins(field: str) -> list[str]:
+        seen: set[str] = set()
+        collected: list[str] = []
+        for entry in reversed(layers):
+            for item in reversed(getattr(entry, field)):
+                if item not in seen:
+                    seen.add(item)
+                    collected.append(item)
+        collected.reverse()
+        return collected
+
+    merged_decisions = _merge_top_wins("decisions")
+    merged_learnings = _merge_top_wins("learnings")
+    merged_files = _merge_top_wins("filesChanged")
+
+    def _layer_id(owner: Path, entry: SessionEntry) -> str:
+        return entry.sessionId if owner == project_dir else f"{owner.name}/{entry.sessionId}"
+
+    structured = {
+        "layers": [_layer_id(o, e) for o, e in resolved],
+        "repos": _dedupe_preserve_order([o.name for o in owners]),
+        "decisions": merged_decisions[-STACK_VERBATIM_DECISIONS:],
+        "learnings": merged_learnings[-STACK_VERBATIM_LEARNINGS:],
+        "filesChanged": merged_files[-STACK_VERBATIM_FILES:],
+    }
+
+    cross = len(structured["repos"]) > 1
+    lines: list[str] = []
+    header = f"🧱 Layered context — {len(layers)} layer(s) (base → top)"
+    if cross:
+        header += f" across {len(structured['repos'])} repos"
+    lines.append(header)
+    lines.append("")
+    lines.append("═══ Merged (top-of-stack wins) ═══")
+    if structured["decisions"]:
+        lines.append(f"Decisions ({len(structured['decisions'])}):")
+        lines.extend(f"  • {d}" for d in structured["decisions"])
+    if structured["learnings"]:
+        lines.append(f"Learnings ({len(structured['learnings'])}):")
+        lines.extend(f"  • {l}" for l in structured["learnings"])
+    if structured["filesChanged"]:
+        lines.append(f"Files ({len(structured['filesChanged'])}): " +
+                     ", ".join(structured["filesChanged"]))
+    lines.append("")
+    lines.append("═══ Layers (base → top) ═══")
+    for i, (owner, entry) in enumerate(resolved, 1):
+        prefix = "" if owner == project_dir else f"[{owner.name}] "
+        lines.append(f"[{i}] {prefix}{_digest_parent(entry)}")
+    return "\n".join(lines), structured
+
+
+def apply_stack(
+    project_dir: Path,
+    session_ids: list[str],
+    new_session_id: str,
+    now_iso_str: str,
+    into_name: Optional[str] = None,
+) -> tuple[SessionEntry, Path]:
+    """Materialize a (possibly nested/cross-repo) stack into one merged session.
+
+    Resolves references, loads each layer from its owning repo, and writes a new
+    merged session into `project_dir` (recording every layer under `parents`).
+    """
+    resolved = resolve_stack_entries(project_dir, session_ids)
+    parents = [entry for _, entry in resolved]
+    merged = build_merged_session(parents, new_session_id, now_iso_str)
+
+    target_dir = project_dir / "sessions" / (into_name or "_default")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / f"{new_session_id}.json"
+    _write_json(target_path, merged.model_dump())
     save_latest_session(project_dir, LatestSession(
         lastSessionId=new_session_id,
         lastUpdatedAt=now_iso_str,

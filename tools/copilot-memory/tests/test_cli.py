@@ -370,3 +370,51 @@ class TestCmdSessionMerge:
             ))
         assert code == 2
         assert "Unknown session" in capsys.readouterr().out
+
+
+class TestCmdSessionStackAndList:
+    def test_session_list_current_repo(self, mock_memory, capsys):
+        from copilot_memory.cli import cmd_session_list
+        from types import SimpleNamespace
+        tmp_path, project_dir = mock_memory
+        args = SimpleNamespace(cwd=None, repo=None, all_repos=False)
+        with patch("copilot_memory.cli.find_project_dir", return_value=project_dir):
+            code = cmd_session_list(args)
+        out = capsys.readouterr().out
+        assert code == 0
+        assert "test-session-001" in out
+        assert "Test session" in out
+
+    def test_stack_save_show_and_list(self, mock_memory, capsys):
+        from copilot_memory.cli import cmd_session_stack
+        from types import SimpleNamespace
+        tmp_path, project_dir = mock_memory
+        gdir = tmp_path / "_global"
+        save = SimpleNamespace(cwd=None, stack_action="save", name="common",
+                               sids=["test-session-001"], append=False,
+                               description="everyday", global_=False)
+        with patch("copilot_memory.cli.find_project_dir", return_value=project_dir), \
+             patch("copilot_memory.cli.GLOBAL_DIR", gdir), \
+             patch("copilot_memory.store.GLOBAL_DIR", gdir):
+            assert cmd_session_stack(save) == 0
+            show = SimpleNamespace(cwd=None, stack_action="show", stack="common",
+                                   sids=[], json=False)
+            assert cmd_session_stack(show) == 0
+            out = capsys.readouterr().out
+            assert "Layered context" in out
+            lst = SimpleNamespace(cwd=None, stack_action="list", global_=False)
+            assert cmd_session_stack(lst) == 0
+            assert "common" in capsys.readouterr().out
+
+    def test_stack_show_unknown_returns_two(self, mock_memory, capsys):
+        from copilot_memory.cli import cmd_session_stack
+        from types import SimpleNamespace
+        tmp_path, project_dir = mock_memory
+        gdir = tmp_path / "_global"
+        show = SimpleNamespace(cwd=None, stack_action="show", stack="ghost",
+                               sids=[], json=False)
+        with patch("copilot_memory.cli.find_project_dir", return_value=project_dir), \
+             patch("copilot_memory.cli.GLOBAL_DIR", gdir), \
+             patch("copilot_memory.store.GLOBAL_DIR", gdir):
+            assert cmd_session_stack(show) == 2
+        assert "Unknown stack" in capsys.readouterr().out

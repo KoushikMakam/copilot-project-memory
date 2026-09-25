@@ -516,3 +516,134 @@ class TestSessionMerge:
         latest = load_latest_session(tmp_project)
         assert latest.lastSessionId == "feature-x-1"
         assert latest.activeSession == "feature-x"
+
+
+class TestSessionStack:
+    def _mk(self, sid, **kwargs):
+        base = dict(
+            sessionId=sid,
+            status="active",
+            startedAt="2026-06-01T00:00:00Z",
+            lastUpdatedAt="2026-06-01T00:00:00Z",
+        )
+        base.update(kwargs)
+        return SessionEntry(**base)
+
+    def _write(self, project_dir, entry):
+        p = project_dir / "sessions" / "_default" / f"{entry.sessionId}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(p, entry.model_dump())
+        return p
+
+    def test_upsert_and_load_stack(self, tmp_project):
+        from copilot_memory.store import upsert_stack, load_stacks, find_stack
+
+        upsert_stack(tmp_project, "common", ["a", "b"], "2026-06-11T00:00:00Z",
+                     description="everyday")
+        stacks = load_stacks(tmp_project)
+        s = find_stack(stacks, "common")
+        assert s is not None
+        assert s.sessions == ["a", "b"]
+        assert s.description == "everyday"
+
+    def test_upsert_replace_and_append(self, tmp_project):
+        from copilot_memory.store import upsert_stack, load_stacks, find_stack
+
+        upsert_stack(tmp_project, "bms", ["a", "b"], "t")
+        upsert_stack(tmp_project, "bms", ["b", "c"], "t", append=True)
+        s = find_stack(load_stacks(tmp_project), "bms")
+        assert s.sessions == ["a", "b", "c"]  # deduped append
+        upsert_stack(tmp_project, "bms", ["x"], "t")  # replace
+        s = find_stack(load_stacks(tmp_project), "bms")
+        assert s.sessions == ["x"]
+
+    def test_remove_from_stack_and_delete(self, tmp_project):
+        from copilot_memory.store import upsert_stack, remove_from_stack, load_stacks, find_stack
+
+        upsert_stack(tmp_project, "s", ["a", "b", "c"], "t")
+        remove_from_stack(tmp_project, "s", ["b"], "t")
+        assert find_stack(load_stacks(tmp_project), "s").sessions == ["a", "c"]
+        deleted = remove_from_stack(tmp_project, "s", None, "t")
+        assert deleted is None
+        assert find_stack(load_stacks(tmp_project), "s") is None
+
+    def test_remove_unknown_stack_raises(self, tmp_project):
+        from copilot_memory.store import remove_from_stack
+
+        with pytest.raises(KeyError):
+            remove_from_stack(tmp_project, "ghost", None, "t")
+
+    def test_assemble_stack_top_wins_and_dedupes(self, tmp_project):
+        from copilot_memory.store import assemble_stack
+
+        self._write(tmp_project, self._mk(
+            "base", decisions=["use SQLite"], learnings=["index it"],
+            filesChanged=["a.py", "shared.py"]))
+        self._write(tmp_project, self._mk(
+            "top", decisions=["use Postgres"], learnings=["index it", "pool conns"],
+            filesChanged=["b.py", "shared.py"]))
+        rendered, structured = assemble_stack(tmp_project, ["base", "top"])
+        assert structured["layers"] == ["base", "top"]
+        # dedupe preserved, both decisions present
+        assert "use SQLite" in structured["decisions"]
+        assert "use Postgres" in structured["decisions"]
+        assert structured["learnings"].count("index it") == 1
+        assert "shared.py" in structured["filesChanged"]
+        assert structured["filesChanged"].count("shared.py") == 1
+        assert "Layered context" in rendered
+
+    def test_assemble_stack_missing_raises(self, tmp_project):
+        from copilot_memory.store import assemble_stack
+
+        self._write(tmp_project, self._mk("real"))
+        with pytest.raises(ValueError, match="Unknown session"):
+            assemble_stack(tmp_project, ["real", "ghost"])
+
+    def test_nested_stack_reference_resolves(self, tmp_project):
+        from copilot_memory.store import upsert_stack, assemble_stack
+
+        self._write(tmp_project, self._mk("a", decisions=["A"]))
+        self._write(tmp_project, self._mk("b", decisions=["B"]))
+        self._write(tmp_project, self._mk("c", decisions=["C"]))
+        upsert_stack(tmp_project, "inner", ["a", "b"], "t")
+        # outer references the inner stack via @inner, then adds c on top
+        _, structured = assemble_stack(tmp_project, ["@inner", "c"])
+        assert structured["layers"] == ["a", "b", "c"]
+        assert structured["decisions"] == ["A", "B", "C"]
+
+    def test_cyclic_stack_reference_raises(self, tmp_project):
+        from copilot_memory.store import upsert_stack, assemble_stack
+
+        self._write(tmp_project, self._mk("a"))
+        upsert_stack(tmp_project, "x", ["@y", "a"], "t")
+        upsert_stack(tmp_project, "y", ["@x"], "t")
+        with pytest.raises(ValueError, match="[Cc]yclic|too deep"):
+            assemble_stack(tmp_project, ["@x"])
+
+    def test_cross_repo_and_global_reference(self, tmp_path, monkeypatch):
+        from copilot_memory import store as store_mod
+
+        root = tmp_path / "memroot"
+        (root / "_global").mkdir(parents=True)
+        monkeypatch.setattr(store_mod, "MEMORY_ROOT", root)
+        monkeypatch.setattr(store_mod, "GLOBAL_DIR", root / "_global")
+
+        repo_a = root / "repo-a"
+        repo_b = root / "repo-b"
+        for r, sid, dec in ((repo_a, "auth", "A-auth"), (repo_b, "api", "B-api")):
+            (r / "sessions" / "_default").mkdir(parents=True)
+            _write_json(r / "sessions" / "_default" / f"{sid}.json",
+                        self._mk(sid, decisions=[dec]).model_dump())
+
+        # global stack references a session in each repo
+        store_mod.upsert_stack(repo_a, "multi", ["repo-a/auth", "repo-b/api"], "t",
+                               catalog_dir=root / "_global")
+        # resolve from repo_a via @multi (found in global), layering base repo_a
+        _, structured = store_mod.assemble_stack(repo_a, ["@multi"])
+        assert structured["layers"] == ["auth", "repo-b/api"]
+        assert set(structured["repos"]) == {"repo-a", "repo-b"}
+        assert structured["decisions"] == ["A-auth", "B-api"]
+
+
+
+

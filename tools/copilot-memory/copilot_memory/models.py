@@ -100,6 +100,39 @@ class LatestSession(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Stacks (named, ordered "chained lists" of sessions layered for rich context)
+# ---------------------------------------------------------------------------
+
+class Stack(BaseModel):
+    """A named, ordered chain of session IDs to layer together.
+
+    Ordering is base-first → top-last: the first entry is the foundational
+    layer, later entries are stacked on top and win on conflicts (their
+    decisions/learnings are treated as more recent/authoritative).
+    """
+    name: str
+    sessions: list[str] = []
+    description: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        if not v or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9\-_]*$", v):
+            raise ValueError(
+                f"Stack name must be alphanumeric with hyphens/underscores: '{v}'"
+            )
+        return v
+
+
+class StacksFile(BaseModel):
+    """Schema for stacks.yml — the catalog of named layer-stacks."""
+    schema_version: int = 1
+    stacks: list[Stack] = []
+
+
+# ---------------------------------------------------------------------------
 # Verification results
 # ---------------------------------------------------------------------------
 

@@ -27,6 +27,7 @@ Files are YAML (rules.yml, preferences.yml, context.yml, tracking.yml) + JSON (s
 | `:prefs` | Read `preferences.yml` from the project memory folder and display key-value pairs |
 | `:prefs set <k> <v>` | Read `preferences.yml`, set/update the key under the appropriate section, write back |
 | `:context` | Read `context.yml` from the project memory folder and display it |
+| `:sessions` | Run `copilot-memory session list` — show session IDs/summaries so you can reference them in stacks (`--repo NAME` or `--all-repos` for other repos) |
 | `:help` | Show command list |
 
 **Finding the project memory folder:**
@@ -35,7 +36,7 @@ Files are YAML (rules.yml, preferences.yml, context.yml, tracking.yml) + JSON (s
 3. Look for `~/.copilot/project-memory/<name>/` (e.g., `~/.copilot/project-memory/my-project/`)
 4. If it doesn't exist, run `copilot-memory init` first
 
-**Complex ops — use `copilot-memory` CLI** (deterministic, validated):
+**Complex ops — use `copilot-memory` CLI** (deterministic, validated). `cmem` and `cm` are short aliases for `copilot-memory`:
 
 | User types | Run this command |
 |-----------|-----------------|
@@ -43,6 +44,43 @@ Files are YAML (rules.yml, preferences.yml, context.yml, tracking.yml) + JSON (s
 | `:compact` | `copilot-memory compact` |
 | `:export team` | `copilot-memory export team` |
 | `:init` | `copilot-memory init` |
+| `:stacks` | `copilot-memory session stack list` |
+| `:stack <name>` | `copilot-memory session stack show --stack <name>` — then load that layered context into working memory |
+| `:stack save <name> <refs…>` | `copilot-memory session stack save <name> <refs…>` (base first → top last; add `--global` for cross-repo) |
+| `:stack add <name> <refs…>` | `copilot-memory session stack save <name> <refs…> --append` |
+| `:stack rm <name> [refs…]` | `copilot-memory session stack rm <name> [refs…]` (omit refs to delete the stack) |
+| `:stack apply <name>` | `copilot-memory session stack apply --stack <name>` (materialize as one merged session) |
+| `:layer <refs…>` | `copilot-memory session stack show <refs…>` — ad-hoc pick-and-choose, no save |
+
+### Layered Context (Stacks)
+
+A **stack** is a named, ordered *chained list* of sessions layered together so context
+gets richer than a single `:resume`. You pick and choose exactly which sessions to layer,
+**and stacks are composable and cross-repo** — a stack can reference other stacks and
+sessions living in other repos (a "multi-repo session").
+
+- **Reference grammar** (each entry, base → top):
+  - `sessionId` — a session in the current repo
+  - `@stackName` — another stack (chained list), inlined recursively (project or global)
+  - `repo/sessionId` — a session in another repo's memory
+  - `repo/@stackName` — another repo's stack, inlined
+- **Ordering is base → top.** Later layers **win on conflicts** (treated as most recent).
+- **Reusable profiles.** Save a stack per workstream, e.g. `common` for everyday work and
+  `BMS` for BackupMgmt — each is its own chained list you reload anytime.
+- **Cross-repo / global.** Save a multi-repo stack with `--global` (lives in `_global`) so
+  it's reachable from any repo; resolution searches the current repo then global.
+- **How to load:** when the user runs `:stack <name>` (or `:layer <refs…>`), run the
+  matching `copilot-memory session stack show …` command, then treat the printed
+  "Merged" decisions/learnings/files as active context for the rest of the conversation.
+- **Discover sessions to reference:** run `copilot-memory session list` (add `--repo NAME`
+  or `--all-repos`) to see session IDs — it prints the exact `repo/sessionId` ref form.
+- **Pick-and-choose:** `:layer <ref1> <ref2> …` layers arbitrary sessions/stacks on the fly
+  without saving; `:stack save <name> <refs…>` persists the selection for reuse.
+- **Materialize:** `:stack apply <name>` collapses the layers (even across repos) into one
+  new merged session (records all layers under `parents`) so future auto-saves build on it.
+
+Resolution is recursive with cycle detection; the assembled view is deduped and
+token-capped, so layering many sessions across repos stays cheap.
 
 ### YAML Write Rules (when handling inline)
 

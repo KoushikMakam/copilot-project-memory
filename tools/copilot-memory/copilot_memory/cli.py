@@ -39,10 +39,14 @@ from copilot_memory.store import (
     MEMORY_ROOT,
     TEMPLATE_DIR,
     archive_closed_sessions,
+    assemble_stack,
+    apply_stack,
     check_session_integrity,
     ensure_project_dir,
     find_project_dir,
+    find_project_dir_by_name,
     find_session_file,
+    find_stack,
     get_dir_size,
     list_sessions,
     load_context,
@@ -50,12 +54,16 @@ from copilot_memory.store import (
     load_prefs,
     load_rules,
     load_session,
+    load_stacks,
+    load_global_stacks,
     merge_sessions,
+    remove_from_stack,
     save_rules,
     save_context,
     save_prefs,
     save_latest_session,
     session_needs_compaction,
+    upsert_stack,
     _read_yaml,
     _write_yaml,
     _read_json,
@@ -516,6 +524,158 @@ def cmd_session_check_size(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_stack_sessions(project_dir, args) -> Optional[list]:
+    """Build the ref list to layer from --stack NAME and/or positional sids.
+
+    `--stack NAME` becomes an `@NAME` reference so nested/global stacks resolve
+    uniformly; positional sids/refs are layered on top.
+    """
+    refs: list = []
+    stack_name = getattr(args, "stack", None)
+    if stack_name:
+        refs.append("@" + stack_name)
+    refs.extend(getattr(args, "sids", []) or [])
+    return refs
+
+
+def cmd_session_list(args: argparse.Namespace) -> int:
+    """List sessions (IDs, summary, status) for discovery/referencing."""
+    base = find_project_dir(args.cwd)
+
+    targets: list = []
+    if getattr(args, "all_repos", False):
+        if MEMORY_ROOT.exists():
+            targets = [d for d in sorted(MEMORY_ROOT.iterdir())
+                       if d.is_dir() and d.name != "_template"]
+    elif getattr(args, "repo", None):
+        found = find_project_dir_by_name(args.repo)
+        if not found:
+            print(f"{_c(RED, '❌ Unknown repo')} '{args.repo}'")
+            return 2
+        targets = [found]
+    else:
+        if not base:
+            print(f"{_c(YELLOW, '⚠️  No project memory for this directory.')} "
+                  f"Use --repo NAME or --all-repos.")
+            return 2
+        targets = [base]
+
+    any_printed = False
+    for project_dir in targets:
+        sessions = list_sessions(project_dir)
+        if not sessions:
+            continue
+        any_printed = True
+        cross = project_dir != base
+        print(f"\n{_c(BOLD + CYAN, '📂 ' + project_dir.name)}"
+              + (f"  {_c(DIM, '(reference as ' + project_dir.name + '/<id>)')}" if cross else ""))
+        for path, entry in sessions:
+            folder = path.parent.name
+            updated = (entry.lastUpdatedAt or entry.startedAt or "")[:10]
+            ref = f"{project_dir.name}/{entry.sessionId}" if cross else entry.sessionId
+            summary = entry.summary or "(no summary)"
+            print(f"  {_c(BOLD, ref)}  {_c(DIM, f'[{entry.status}] {updated} · {folder}')}")
+            print(f"      {summary}")
+    if not any_printed:
+        print(f"{_c(DIM, 'No sessions found.')}")
+    return 0
+
+
+def cmd_session_stack(args: argparse.Namespace) -> int:
+    """Manage and assemble named layer-stacks (chained lists of sessions)."""
+    project_dir = find_project_dir(args.cwd) or GLOBAL_DIR
+    is_global = getattr(args, "global_", False)
+    catalog_dir = GLOBAL_DIR if is_global else project_dir
+
+    action = getattr(args, "stack_action", None)
+
+    if action == "list":
+        printed = False
+        proj_stacks = load_stacks(project_dir)
+        if proj_stacks.stacks and project_dir != GLOBAL_DIR:
+            print(f"{_c(BOLD + CYAN, f'🧱 Stacks in {project_dir.name}:')}")
+            for s in proj_stacks.stacks:
+                desc = f" — {s.description}" if s.description else ""
+                print(f"  {_c(BOLD, s.name)} ({len(s.sessions)} layers){desc}")
+                print(f"    {_c(DIM, ' → '.join(s.sessions) or '(empty)')}")
+            printed = True
+        global_stacks = load_global_stacks()
+        if global_stacks.stacks:
+            print(f"{_c(BOLD + CYAN, '🌍 Global (cross-repo) stacks:')}")
+            for s in global_stacks.stacks:
+                desc = f" — {s.description}" if s.description else ""
+                print(f"  {_c(BOLD, s.name)} ({len(s.sessions)} layers){desc}")
+                print(f"    {_c(DIM, ' → '.join(s.sessions) or '(empty)')}")
+            printed = True
+        if not printed:
+            print(f"{_c(DIM, 'No stacks defined. Create one: copilot-memory session stack save <name> <ref...>')}")
+        return 0
+
+    if action == "save":
+        stack = upsert_stack(project_dir, args.name, args.sids, now_iso(),
+                             description=getattr(args, "description", "") or "",
+                             append=getattr(args, "append", False),
+                             catalog_dir=catalog_dir)
+        verb = "Updated" if getattr(args, "append", False) else "Saved"
+        where = " (global)" if is_global else ""
+        print(f"{_c(GREEN, f'✅ {verb} stack')} '{stack.name}'{where} ({len(stack.sessions)} layers)")
+        print(f"  {_c(DIM, ' → '.join(stack.sessions))}")
+        return 0
+
+    if action == "rm":
+        try:
+            updated = remove_from_stack(project_dir, args.name,
+                                        getattr(args, "sids", None), now_iso(),
+                                        catalog_dir=catalog_dir)
+        except KeyError:
+            print(f"{_c(RED, '❌ No stack named')} '{args.name}'"
+                  + (" (global)" if is_global else ""))
+            return 2
+        if updated is None:
+            print(f"{_c(GREEN, '✅ Deleted stack')} '{args.name}'")
+        else:
+            print(f"{_c(GREEN, '✅ Updated stack')} '{updated.name}' ({len(updated.sessions)} layers)")
+        return 0
+
+    if action == "show":
+        refs = _resolve_stack_sessions(project_dir, args)
+        if not refs:
+            print(f"{_c(RED, '❌ Nothing to layer. Pass --stack NAME and/or session refs.')}")
+            return 2
+        try:
+            rendered, structured = assemble_stack(project_dir, refs)
+        except ValueError as e:
+            print(f"{_c(RED, '❌')} {e}")
+            return 2
+        if getattr(args, "json", False):
+            print(json.dumps(structured, indent=2, ensure_ascii=False))
+        else:
+            print(rendered)
+        return 0
+
+    if action == "apply":
+        refs = _resolve_stack_sessions(project_dir, args)
+        if not refs:
+            print(f"{_c(RED, '❌ Nothing to layer. Pass --stack NAME and/or session refs.')}")
+            return 2
+        new_sid = getattr(args, "new_id", None) or str(uuid.uuid4())
+        try:
+            merged, path = apply_stack(
+                project_dir, refs, new_session_id=new_sid,
+                now_iso_str=now_iso(), into_name=getattr(args, "into", None),
+            )
+        except ValueError as e:
+            print(f"{_c(RED, '❌')} {e}")
+            return 2
+        print(f"{_c(GREEN, '✅ Applied stack →')} {path}")
+        print(f"  sessionId: {merged.sessionId}")
+        print(f"  layers: {', '.join(merged.parents)}")
+        return 0
+
+    print(f"{_c(YELLOW, 'Specify a stack action: list | save | rm | show | apply')}")
+    return 2
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Create project memory for the current directory."""
     existing = find_project_dir(args.cwd)
@@ -719,6 +879,15 @@ def main():
                          help="Look up session by ID (searches sessions/**)")
     _add_cwd(p_check)
 
+    p_list = session_sub.add_parser(
+        "list",
+        help="List sessions (IDs, summary, status) for discovery/referencing",
+    )
+    p_list.add_argument("--repo", help="List sessions in another repo by name")
+    p_list.add_argument("--all-repos", dest="all_repos", action="store_true",
+                        help="List sessions across every repo's memory")
+    _add_cwd(p_list)
+
     p_arch = session_sub.add_parser(
         "archive",
         help="Gzip closed sessions older than N days (default: 7)",
@@ -740,6 +909,53 @@ def main():
                          help="Preview merge without writing")
     _add_cwd(p_merge)
 
+    # --- session stack (named, ordered chains layered for rich context) ---
+    p_stack = session_sub.add_parser(
+        "stack",
+        help="Layer sessions into rich context via named chains (pick & choose)",
+    )
+    stack_sub = p_stack.add_subparsers(dest="stack_action", help="Stack actions")
+
+    ps_list = stack_sub.add_parser("list", help="List all named stacks")
+    _add_cwd(ps_list)
+
+    ps_save = stack_sub.add_parser(
+        "save", help="Create/replace a named stack (ordered base→top)")
+    ps_save.add_argument("name", help="Stack name (e.g. common, BMS)")
+    ps_save.add_argument("sids", nargs="+",
+                         help="Refs in layer order (base first): sessionId, @stack, repo/sessionId, repo/@stack")
+    ps_save.add_argument("--append", action="store_true",
+                         help="Append to the existing chain instead of replacing")
+    ps_save.add_argument("--description", help="Optional description")
+    ps_save.add_argument("--global", dest="global_", action="store_true",
+                         help="Store in the global cross-repo catalog (_global)")
+    _add_cwd(ps_save)
+
+    ps_rm = stack_sub.add_parser(
+        "rm", help="Remove sessions from a stack, or delete the whole stack")
+    ps_rm.add_argument("name", help="Stack name")
+    ps_rm.add_argument("sids", nargs="*",
+                       help="Refs to remove (omit to delete the stack)")
+    ps_rm.add_argument("--global", dest="global_", action="store_true",
+                       help="Target the global cross-repo catalog (_global)")
+    _add_cwd(ps_rm)
+
+    ps_show = stack_sub.add_parser(
+        "show", help="Assemble & print the layered context for a stack and/or refs")
+    ps_show.add_argument("--stack", help="Named stack to layer (project or global)")
+    ps_show.add_argument("sids", nargs="*",
+                         help="Extra refs to layer on top: sessionId, @stack, repo/sessionId, repo/@stack")
+    ps_show.add_argument("--json", action="store_true", help="Emit structured JSON")
+    _add_cwd(ps_show)
+
+    ps_apply = stack_sub.add_parser(
+        "apply", help="Materialize a stack (incl. cross-repo) as a new merged session")
+    ps_apply.add_argument("--stack", help="Named stack to layer (project or global)")
+    ps_apply.add_argument("sids", nargs="*", help="Extra refs to layer on top")
+    ps_apply.add_argument("--into", help="Target named-session folder (default: _default)")
+    ps_apply.add_argument("--new-id", dest="new_id", help="Explicit merged session ID")
+    _add_cwd(ps_apply)
+
     args = parser.parse_args()
 
     if args.command == "status":
@@ -755,12 +971,16 @@ def main():
     elif args.command == "export":
         sys.exit(cmd_export(args))
     elif args.command == "session":
+        if getattr(args, "session_command", None) == "list":
+            sys.exit(cmd_session_list(args))
         if getattr(args, "session_command", None) == "check-size":
             sys.exit(cmd_session_check_size(args))
         if getattr(args, "session_command", None) == "archive":
             sys.exit(cmd_session_archive(args))
         if getattr(args, "session_command", None) == "merge":
             sys.exit(cmd_session_merge(args))
+        if getattr(args, "session_command", None) == "stack":
+            sys.exit(cmd_session_stack(args))
         parser.parse_args(["session", "--help"])
         sys.exit(0)
     else:
