@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
@@ -131,7 +132,6 @@ def _read_yaml(path: Path) -> dict:
     if data is None:
         return {}
     if not isinstance(data, dict):
-        import sys
         print(f"Warning: {path} contains non-dict YAML ({type(data).__name__}), treating as empty", file=sys.stderr)
         return {}
     return data
@@ -515,7 +515,11 @@ def load_stacks(project_dir: Path) -> StacksFile:
         return StacksFile()
     try:
         return StacksFile(**raw)
-    except Exception:
+    except Exception as e:
+        # Don't silently drop a hand-edited/corrupt catalog — surface it so the
+        # user knows their stacks "vanished" because the file is malformed.
+        print(f"Warning: {_stacks_path(project_dir)} is malformed ({e}); "
+              f"treating as an empty stack catalog", file=sys.stderr)
         return StacksFile()
 
 
@@ -556,7 +560,14 @@ def find_project_dir_by_name(name: str) -> Optional[Path]:
             return d
         if d.name.startswith(name + "-") or d.name.startswith(slug + "-"):
             candidates.append(d)
-    return candidates[0] if candidates else None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.name)
+    if len(candidates) > 1:
+        print(f"Warning: repo reference '{name}' is ambiguous — matched "
+              f"{[c.name for c in candidates]}; using '{candidates[0].name}'. "
+              f"Use the exact folder name to disambiguate.", file=sys.stderr)
+    return candidates[0]
 
 
 # Guard against cyclic / runaway nested stack references.
@@ -604,6 +615,12 @@ def resolve_stack_refs(
                 raise ValueError(f"Unknown stack '@{stack_name}'"
                                  + (f" in repo '{owner.name}'" if owner != project_dir else ""))
             pairs.extend(resolve_stack_refs(stack.sessions, owner, seen, _depth + 1))
+            # Unwind: `seen` tracks the *current path* (ancestors), not every
+            # stack ever visited. Removing the key after the branch returns lets
+            # a diamond (two layers legitimately reusing the same sub-stack)
+            # resolve, while a true cycle — where a stack is its own ancestor —
+            # still trips the `key in seen` guard above.
+            seen.discard(key)
         else:
             pairs.append((owner, rest))
     return pairs
@@ -630,6 +647,25 @@ def resolve_stack_entries(
     if not layers:
         raise ValueError("stack requires at least one resolvable session")
     return layers
+
+
+def unresolved_stack_refs(project_dir: Path, refs: list[str]) -> list[str]:
+    """Return the refs that do NOT currently resolve (non-raising).
+
+    Each ref is checked independently: an unknown repo/stack, or a ref whose
+    underlying session file is missing, is reported. Used to *warn* (not block)
+    on `stack save` — forward references stay allowed, typos get flagged.
+    """
+    bad: list[str] = []
+    for ref in refs:
+        try:
+            pairs = resolve_stack_refs([ref], project_dir)
+        except ValueError:
+            bad.append(ref)
+            continue
+        if not pairs or any(find_session_file(owner, sid) is None for owner, sid in pairs):
+            bad.append(ref)
+    return bad
 
 
 def upsert_stack(
@@ -699,10 +735,37 @@ def remove_from_stack(
     return existing
 
 
-# Caps for an assembled layered context — keep reload token cost bounded.
-STACK_VERBATIM_DECISIONS = 12
-STACK_VERBATIM_LEARNINGS = 12
-STACK_VERBATIM_FILES = 25
+# Placeholder identity used when previewing a stack: `assemble_stack` runs the
+# exact same merge engine as `apply_stack` so the preview equals what persists,
+# but a preview has no real session id/timestamp of its own.
+_PREVIEW_SESSION_ID = "(preview)"
+
+
+def _layer_ref(project_dir: Path, owner: Path, entry: SessionEntry) -> str:
+    """Human/reference label for a layer — repo-prefixed only when cross-repo."""
+    return entry.sessionId if owner == project_dir else f"{owner.name}/{entry.sessionId}"
+
+
+def _provenance_map(
+    resolved: list[tuple[Path, SessionEntry]],
+    field: str,
+    project_dir: Path,
+) -> dict[str, list[str]]:
+    """Map each field item → the layer refs (base→top) that contributed it.
+
+    Deterministic, no semantics: the CLI cannot judge whether two *different*
+    strings conflict, but it can expose *where each value came from* so a reader
+    (or the AI) can spot contradictions. The rightmost/last source is the
+    topmost (most authoritative) layer.
+    """
+    prov: dict[str, list[str]] = {}
+    for owner, entry in resolved:
+        ref = _layer_ref(project_dir, owner, entry)
+        for item in getattr(entry, field):
+            sources = prov.setdefault(item, [])
+            if ref not in sources:
+                sources.append(ref)
+    return prov
 
 
 def assemble_stack(
@@ -713,41 +776,65 @@ def assemble_stack(
 
     Deterministic, no LLM. References may be raw session IDs, `@stack` names,
     or cross-repo `repo/session` / `repo/@stack` — resolved recursively to an
-    ordered base→top layer list. Later layers win on conflicts: the merged top
-    section is deduped keeping the topmost occurrence. Returns (rendered_text,
+    ordered base→top layer list.
+
+    The merged section is produced by the **same** ``build_merged_session``
+    engine that ``apply_stack`` persists, so ``show`` previews exactly what
+    ``apply`` will write (same dedupe order, same compaction thresholds, same
+    ``compactedSummary``/lineage).
+
+    Each merged entry is annotated with its **provenance** — the layer(s) it came
+    from (base→top; the last one is the authoritative top layer). This surfaces
+    contradictions (e.g. ``[base] use SQLite`` vs ``[top] use PostgreSQL``) that
+    exact-string dedupe would otherwise leave silently side by side, without the
+    CLI having to make a semantic judgment. Returns (rendered_text,
     structured_dict). Raises ValueError if any reference cannot be resolved.
     """
     resolved = resolve_stack_entries(project_dir, session_ids)
     layers = [entry for _, entry in resolved]
     owners = [owner for owner, _ in resolved]
 
-    # Top-of-stack wins: iterate top→base, keep first occurrence, then reverse
-    # so the rendered order stays base→top with newest info retained.
-    def _merge_top_wins(field: str) -> list[str]:
-        seen: set[str] = set()
-        collected: list[str] = []
-        for entry in reversed(layers):
-            for item in reversed(getattr(entry, field)):
-                if item not in seen:
-                    seen.add(item)
-                    collected.append(item)
-        collected.reverse()
-        return collected
+    # Preview == persist: run the identical merge engine apply_stack uses.
+    preview = build_merged_session(layers, _PREVIEW_SESSION_ID, "")
 
-    merged_decisions = _merge_top_wins("decisions")
-    merged_learnings = _merge_top_wins("learnings")
-    merged_files = _merge_top_wins("filesChanged")
+    prov_decisions = _provenance_map(resolved, "decisions", project_dir)
+    prov_learnings = _provenance_map(resolved, "learnings", project_dir)
+    prov_files = _provenance_map(resolved, "filesChanged", project_dir)
 
-    def _layer_id(owner: Path, entry: SessionEntry) -> str:
-        return entry.sessionId if owner == project_dir else f"{owner.name}/{entry.sessionId}"
+    # Real truncation happened only if the deduped union is larger than what the
+    # merge kept verbatim. (compactedSummary is always populated with per-layer
+    # lineage digests, so its mere presence does NOT imply anything was dropped.)
+    full_decisions = _dedupe_preserve_order([d for e in layers for d in e.decisions])
+    full_learnings = _dedupe_preserve_order([l for e in layers for l in e.learnings])
+    full_files = _dedupe_preserve_order([f for e in layers for f in e.filesChanged])
+    truncated = (
+        len(full_decisions) > len(preview.decisions)
+        or len(full_learnings) > len(preview.learnings)
+        or len(full_files) > len(preview.filesChanged)
+    )
 
     structured = {
-        "layers": [_layer_id(o, e) for o, e in resolved],
+        "layers": [_layer_ref(project_dir, o, e) for o, e in resolved],
         "repos": _dedupe_preserve_order([o.name for o in owners]),
-        "decisions": merged_decisions[-STACK_VERBATIM_DECISIONS:],
-        "learnings": merged_learnings[-STACK_VERBATIM_LEARNINGS:],
-        "filesChanged": merged_files[-STACK_VERBATIM_FILES:],
+        "decisions": preview.decisions,
+        "learnings": preview.learnings,
+        "filesChanged": preview.filesChanged,
+        "compactedSummary": preview.compactedSummary,
+        "truncated": truncated,
+        "provenance": {
+            "decisions": {d: prov_decisions.get(d, []) for d in preview.decisions},
+            "learnings": {l: prov_learnings.get(l, []) for l in preview.learnings},
+            "filesChanged": {f: prov_files.get(f, []) for f in preview.filesChanged},
+        },
     }
+
+    multi = len(layers) > 1
+
+    def _annotate(item: str, prov: dict[str, list[str]]) -> str:
+        sources = prov.get(item, [])
+        if not multi or not sources:
+            return f"  • {item}"
+        return f"  • {item}  ⟵ {', '.join(sources)}"
 
     cross = len(structured["repos"]) > 1
     lines: list[str] = []
@@ -755,17 +842,22 @@ def assemble_stack(
     if cross:
         header += f" across {len(structured['repos'])} repos"
     lines.append(header)
+    if multi:
+        lines.append("(each entry is tagged ⟵ with its source layer(s); the last is the top/authoritative layer)")
     lines.append("")
-    lines.append("═══ Merged (top-of-stack wins) ═══")
+    lines.append("═══ Merged (previews what `stack apply` will persist) ═══")
     if structured["decisions"]:
         lines.append(f"Decisions ({len(structured['decisions'])}):")
-        lines.extend(f"  • {d}" for d in structured["decisions"])
+        lines.extend(_annotate(d, prov_decisions) for d in structured["decisions"])
     if structured["learnings"]:
         lines.append(f"Learnings ({len(structured['learnings'])}):")
-        lines.extend(f"  • {l}" for l in structured["learnings"])
+        lines.extend(_annotate(l, prov_learnings) for l in structured["learnings"])
     if structured["filesChanged"]:
         lines.append(f"Files ({len(structured['filesChanged'])}): " +
                      ", ".join(structured["filesChanged"]))
+    if structured["truncated"]:
+        lines.append("")
+        lines.append("(older entries exceeded the merge cap and will fold into compactedSummary on apply)")
     lines.append("")
     lines.append("═══ Layers (base → top) ═══")
     for i, (owner, entry) in enumerate(resolved, 1):
@@ -785,6 +877,8 @@ def apply_stack(
 
     Resolves references, loads each layer from its owning repo, and writes a new
     merged session into `project_dir` (recording every layer under `parents`).
+    Uses the same ``build_merged_session`` engine as ``assemble_stack``'s
+    preview, so what ``show`` displayed is what gets persisted here.
     """
     resolved = resolve_stack_entries(project_dir, session_ids)
     parents = [entry for _, entry in resolved]
@@ -884,6 +978,26 @@ def check_session_integrity(project_dir: Path) -> tuple[list[str], list[str]]:
             )
 
     return dangling, mismatched
+
+
+def check_stack_integrity(project_dir: Path) -> list[str]:
+    """Report stack references that no longer resolve (dangling refs).
+
+    Non-destructive: scans the project catalog and the global catalog, resolving
+    each stack's refs from `project_dir`'s perspective, and returns a list of
+    human-readable problem strings. A ref goes stale when its session is
+    archived away, renamed, deleted, or its repo/nested-stack no longer exists.
+    """
+    problems: list[str] = []
+    catalogs = [("project", load_stacks(project_dir))]
+    global_stacks = load_global_stacks()
+    if global_stacks.stacks:
+        catalogs.append(("global", global_stacks))
+    for label, sfile in catalogs:
+        for s in sfile.stacks:
+            for bad in unresolved_stack_refs(project_dir, s.sessions):
+                problems.append(f"stack '{s.name}' ({label}) -> {bad} (unresolvable)")
+    return problems
 
 
 def get_dir_size(path: Path) -> int:

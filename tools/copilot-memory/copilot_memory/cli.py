@@ -42,6 +42,7 @@ from copilot_memory.store import (
     assemble_stack,
     apply_stack,
     check_session_integrity,
+    check_stack_integrity,
     ensure_project_dir,
     find_project_dir,
     find_project_dir_by_name,
@@ -63,6 +64,7 @@ from copilot_memory.store import (
     save_prefs,
     save_latest_session,
     session_needs_compaction,
+    unresolved_stack_refs,
     upsert_stack,
     _read_yaml,
     _write_yaml,
@@ -304,10 +306,19 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if not dangling and not mismatched:
         print(f"  {_c(GREEN, '✅')} Sessions: no integrity issues")
 
+    # 2b. Check stacks for dangling references
+    stack_problems = check_stack_integrity(project_dir)
+    report.dangling_stack_refs = stack_problems
+    if stack_problems:
+        for p in stack_problems:
+            print(f"  {_c(RED, '❌')} Dangling stack ref: {p}")
+    else:
+        print(f"  {_c(GREEN, '✅')} Stacks: no dangling references")
+
     # 3. Summary
     report.total_size_bytes = get_dir_size(project_dir)
     errors = sum(1 for c in report.checks if c.status in ("missing", "malformed"))
-    errors += len(dangling) + len(mismatched)
+    errors += len(dangling) + len(mismatched) + len(stack_problems)
 
     print(f"\n{'─' * 45}")
     if errors == 0:
@@ -612,6 +623,11 @@ def cmd_session_stack(args: argparse.Namespace) -> int:
         return 0
 
     if action == "save":
+        # Warn (don't block) on refs that don't currently resolve — this catches
+        # typos while still allowing forward references to not-yet-created work.
+        bad = unresolved_stack_refs(project_dir, args.sids)
+        if bad:
+            print(f"{_c(YELLOW, '⚠️  Unresolved ref(s) in stack (saved anyway):')} {', '.join(bad)}")
         stack = upsert_stack(project_dir, args.name, args.sids, now_iso(),
                              description=getattr(args, "description", "") or "",
                              append=getattr(args, "append", False),

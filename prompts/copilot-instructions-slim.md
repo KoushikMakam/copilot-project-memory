@@ -72,6 +72,10 @@ sessions living in other repos (a "multi-repo session").
 - **How to load:** when the user runs `:stack <name>` (or `:layer <refs…>`), run the
   matching `copilot-memory session stack show …` command, then treat the printed
   "Merged" decisions/learnings/files as active context for the rest of the conversation.
+  The preview is produced by the same engine as `apply`, so it reflects exactly what
+  `:stack apply` would persist. Each entry is tagged `⟵ <layers>` (its provenance); when
+  two entries **contradict**, prefer the one from the **last/top** layer and flag the
+  conflict to the user rather than silently keeping both.
 - **Discover sessions to reference:** run `copilot-memory session list` (add `--repo NAME`
   or `--all-repos`) to see session IDs — it prints the exact `repo/sessionId` ref form.
 - **Pick-and-choose:** `:layer <ref1> <ref2> …` layers arbitrary sessions/stacks on the fly
@@ -79,8 +83,13 @@ sessions living in other repos (a "multi-repo session").
 - **Materialize:** `:stack apply <name>` collapses the layers (even across repos) into one
   new merged session (records all layers under `parents`) so future auto-saves build on it.
 
-Resolution is recursive with cycle detection; the assembled view is deduped and
-token-capped, so layering many sessions across repos stays cheap.
+Resolution is recursive with cycle detection (diamonds allowed, true cycles raise). `stack show`
+previews the layered context using the same merge engine `stack apply` persists, so the preview
+equals what gets materialized (deduped, order-preserving, older entries folded into
+`compactedSummary`). Dedupe is exact-string only, so contradictory entries both survive; each is
+annotated with its source layer(s) (`⟵ base, top`) so the AI/user can resolve conflicts (top layer
+wins). `stack save` warns (doesn't block) on refs that don't resolve; `copilot-memory verify`
+reports dangling stack refs.
 
 ### YAML Write Rules (when handling inline)
 

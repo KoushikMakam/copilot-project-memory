@@ -150,13 +150,15 @@ class VerifyReport(BaseModel):
     total_size_bytes: int = 0
     dangling_sessions: list[str] = []
     mismatched_ids: list[str] = []
+    dangling_stack_refs: list[str] = []
 
     @property
     def has_errors(self) -> bool:
         return any(
             c.status in ("malformed", "missing")
             for c in self.checks
-        ) or bool(self.dangling_sessions) or bool(self.mismatched_ids)
+        ) or bool(self.dangling_sessions) or bool(self.mismatched_ids) \
+            or bool(self.dangling_stack_refs)
 
 
 # ---------------------------------------------------------------------------

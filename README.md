@@ -253,10 +253,22 @@ copilot-memory session stack show --stack mono          — Layers across repoA 
 copilot-memory session stack save big @mono extra-sid   — Nest @mono inside another stack
 ```
 
-Ordering is **base → top**: later layers win on conflicts (treated as most recent).
-Resolution is **recursive with cycle detection**, and the assembled view is **deduped and
-token-capped**, so layering many sessions across repos stays cheap. Under the hood:
+Ordering is **base → top**. Resolution is **recursive with cycle detection**. `stack show`
+previews the layered context using the **same merge engine** `stack apply` persists — so
+what you preview is exactly what gets materialized (deduped, order-preserving, with older
+entries folded into `compactedSummary` once the merge thresholds are crossed).
+
+Because dedupe is **exact-string only**, two *contradictory* entries (e.g. `use SQLite` vs
+`use PostgreSQL`) both survive — the CLI makes no semantic judgment. Instead, every merged
+entry is annotated with its **provenance** (`⟵ base, top`), so contradictions are visible
+and the reader (or the AI) can pick the authoritative one (the last/top layer). Under the hood:
 `copilot-memory session stack {save,add,list,show,apply,rm}` (`--global` targets `_global`).
+
+**Ref validation.** Diamonds are allowed (two layers may reuse the same sub-stack) while
+true cycles still raise. `stack save` **warns** (but does not block) on refs that don't
+currently resolve — typos get flagged, forward references to not-yet-created work stay
+allowed. `copilot-memory verify` reports **dangling stack refs** (a stack pointing at a
+session/repo/nested-stack that no longer resolves) and counts them as integrity errors.
 
 #### Merging Sessions (Combine Multiple Contexts)
 
@@ -513,6 +525,7 @@ copilot-memory session merge <sid1> <sid2> ... [--into NAME] [--new-id ID] [--dr
 - **Atomic writes** — tmp file + rename prevents corruption on crash
 - **BOM handling** — Reads UTF-8 with or without BOM (PowerShell writes BOM)
 - **Session integrity** — Detects dangling pointers, ID mismatches, empty sessions
+- **Stack integrity** — Detects dangling stack refs (sessions/repos/nested stacks that no longer resolve)
 - **Storage caps** — Enforces hard limits on sessions, hotspots, error patterns
 
 ### pipeline CLI
