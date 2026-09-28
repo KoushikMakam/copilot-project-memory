@@ -644,6 +644,164 @@ class TestSessionStack:
         assert set(structured["repos"]) == {"repo-a", "repo-b"}
         assert structured["decisions"] == ["A-auth", "B-api"]
 
+    def test_show_previews_exactly_what_apply_persists(self, tmp_project):
+        """show (assemble_stack) must preview the same content apply persists."""
+        from copilot_memory.store import assemble_stack, apply_stack, load_session
+
+        # Enough entries to cross the merge compaction threshold so the two
+        # code paths would diverge if they used different engines.
+        self._write(tmp_project, self._mk(
+            "base",
+            decisions=[f"d-base-{i}" for i in range(12)],
+            learnings=[f"l-base-{i}" for i in range(12)],
+            filesChanged=[f"base-{i}.py" for i in range(20)]))
+        self._write(tmp_project, self._mk(
+            "top",
+            decisions=[f"d-top-{i}" for i in range(12)],
+            learnings=[f"l-top-{i}" for i in range(12)],
+            filesChanged=[f"top-{i}.py" for i in range(20)]))
+
+        _, structured = assemble_stack(tmp_project, ["base", "top"])
+        merged, path = apply_stack(
+            tmp_project, ["base", "top"],
+            new_session_id="applied-1", now_iso_str="2026-06-11T00:00:00Z")
+        persisted = load_session(path)
+
+        # The preview's merged fields equal what got written to disk.
+        assert structured["decisions"] == persisted.decisions == merged.decisions
+        assert structured["learnings"] == persisted.learnings == merged.learnings
+        assert structured["filesChanged"] == persisted.filesChanged == merged.filesChanged
+        assert structured["compactedSummary"] == persisted.compactedSummary
+
+    def test_provenance_surfaces_conflicting_decisions(self, tmp_project):
+        """Contradictory decisions from different layers must be traceable to
+        their source layer, since exact-string dedupe keeps both."""
+        from copilot_memory.store import assemble_stack
+
+        self._write(tmp_project, self._mk("base", decisions=["use SQLite"]))
+        self._write(tmp_project, self._mk("top", decisions=["use PostgreSQL"]))
+
+        rendered, structured = assemble_stack(tmp_project, ["base", "top"])
+
+        # Both survive (no semantic resolution) but each is attributed.
+        prov = structured["provenance"]["decisions"]
+        assert prov["use SQLite"] == ["base"]
+        assert prov["use PostgreSQL"] == ["top"]
+        # Rendered output tags each entry with its origin layer.
+        assert "use SQLite  ⟵ base" in rendered
+        assert "use PostgreSQL  ⟵ top" in rendered
+
+    def test_provenance_records_agreement_across_layers(self, tmp_project):
+        """A value present in multiple layers lists all contributing layers
+        base→top (last = authoritative)."""
+        from copilot_memory.store import assemble_stack
+
+        self._write(tmp_project, self._mk("base", decisions=["always lint"]))
+        self._write(tmp_project, self._mk("top", decisions=["always lint"]))
+
+        _, structured = assemble_stack(tmp_project, ["base", "top"])
+        assert structured["provenance"]["decisions"]["always lint"] == ["base", "top"]
+
+    def test_single_layer_has_no_provenance_noise(self, tmp_project):
+        """A one-layer stack should not clutter output with ⟵ tags."""
+        from copilot_memory.store import assemble_stack
+
+        self._write(tmp_project, self._mk("solo", decisions=["ship it"]))
+        rendered, structured = assemble_stack(tmp_project, ["solo"])
+        assert "⟵" not in rendered
+        assert structured["provenance"]["decisions"]["ship it"] == ["solo"]
+
+    def test_no_false_truncation_flag(self, tmp_project):
+        """compactedSummary always carries lineage digests; the truncation flag
+        must stay False when nothing actually exceeded the merge cap."""
+        from copilot_memory.store import assemble_stack
+
+        self._write(tmp_project, self._mk("base", decisions=["a"], learnings=["x"]))
+        self._write(tmp_project, self._mk("top", decisions=["b"], learnings=["y"]))
+        rendered, structured = assemble_stack(tmp_project, ["base", "top"])
+        assert structured["truncated"] is False
+        assert "fold into compactedSummary" not in rendered
+
+    def test_truncation_flag_set_when_cap_exceeded(self, tmp_project):
+        from copilot_memory.store import assemble_stack
+
+        self._write(tmp_project, self._mk(
+            "base", decisions=[f"d{i}" for i in range(15)],
+            learnings=[f"l{i}" for i in range(15)]))
+        rendered, structured = assemble_stack(tmp_project, ["base"])
+        assert structured["truncated"] is True
+        assert "fold into compactedSummary" in rendered
+
+    # --- Gap 3: diamond reuse of a shared sub-stack must not be flagged cyclic ---
+    def test_diamond_shared_substack_not_cyclic(self, tmp_project):
+        from copilot_memory.store import upsert_stack, assemble_stack
+
+        self._write(tmp_project, self._mk("s", decisions=["S"]))
+        self._write(tmp_project, self._mk("a", decisions=["A"]))
+        self._write(tmp_project, self._mk("b", decisions=["B"]))
+        upsert_stack(tmp_project, "shared", ["s"], "t")
+        upsert_stack(tmp_project, "left", ["@shared", "a"], "t")
+        upsert_stack(tmp_project, "right", ["@shared", "b"], "t")
+
+        # Both branches legitimately reuse @shared — must resolve, not raise.
+        _, structured = assemble_stack(tmp_project, ["@left", "@right"])
+        assert structured["layers"] == ["s", "a", "s", "b"]
+        assert structured["decisions"] == ["S", "A", "B"]  # base-first dedupe
+
+    def test_true_cycle_still_raises_after_unwind_fix(self, tmp_project):
+        from copilot_memory.store import upsert_stack, assemble_stack
+
+        self._write(tmp_project, self._mk("a"))
+        upsert_stack(tmp_project, "x", ["@y", "a"], "t")
+        upsert_stack(tmp_project, "y", ["@x"], "t")
+        with pytest.raises(ValueError, match="[Cc]yclic|too deep"):
+            assemble_stack(tmp_project, ["@x"])
+
+    # --- Gap 4: save-time ref validation (warn, non-blocking) ---
+    def test_unresolved_stack_refs(self, tmp_project):
+        from copilot_memory.store import unresolved_stack_refs
+
+        self._write(tmp_project, self._mk("real"))
+        bad = unresolved_stack_refs(tmp_project, ["real", "ghost", "@nostack"])
+        assert "real" not in bad
+        assert "ghost" in bad
+        assert "@nostack" in bad
+
+    # --- Gap 5: malformed stacks.yml warns instead of vanishing silently ---
+    def test_malformed_stacks_warns(self, tmp_project, capsys):
+        from copilot_memory.store import load_stacks
+
+        (tmp_project / "stacks.yml").write_text(
+            "schema_version: 1\nstacks: not-a-list\n", encoding="utf-8")
+        result = load_stacks(tmp_project)
+        assert result.stacks == []
+        assert "malformed" in capsys.readouterr().err
+
+    # --- Gap 7: ambiguous repo prefix warns but stays deterministic ---
+    def test_ambiguous_repo_prefix_warns(self, tmp_path, monkeypatch, capsys):
+        from copilot_memory import store as store_mod
+
+        root = tmp_path / "memroot"
+        root.mkdir()
+        (root / "foo-11111111").mkdir()
+        (root / "foo-22222222").mkdir()
+        monkeypatch.setattr(store_mod, "MEMORY_ROOT", root)
+
+        result = store_mod.find_project_dir_by_name("foo")
+        assert result is not None
+        assert result.name == "foo-11111111"  # deterministic: first sorted
+        assert "ambiguous" in capsys.readouterr().err
+
+    # --- Gap 9: verify reports dangling stack refs ---
+    def test_check_stack_integrity_reports_dangling(self, tmp_project):
+        from copilot_memory.store import upsert_stack, check_stack_integrity
+
+        self._write(tmp_project, self._mk("real"))
+        upsert_stack(tmp_project, "mix", ["real", "ghost"], "t")
+        problems = check_stack_integrity(tmp_project)
+        assert any("ghost" in p for p in problems)
+        assert all("real (unresolvable)" not in p for p in problems)
+
 
 
 
