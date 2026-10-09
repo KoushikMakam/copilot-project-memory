@@ -233,6 +233,7 @@ or a session *in another repo*, so one "multi-repo session" pulls it all togethe
 :stack common                         — Load the layered context into the conversation
 :layer auth api                       — Ad-hoc: layer sessions on the fly, no save
 :stack apply common                   — Materialize the stack as one merged session
+:stack refresh --session <id>         — Rebuild a materialized stack if any layer changed
 :stack rm common auth                 — Remove a layer (or the whole stack if no ids)
 ```
 
@@ -262,7 +263,15 @@ Because dedupe is **exact-string only**, two *contradictory* entries (e.g. `use 
 `use PostgreSQL`) both survive — the CLI makes no semantic judgment. Instead, every merged
 entry is annotated with its **provenance** (`⟵ base, top`), so contradictions are visible
 and the reader (or the AI) can pick the authoritative one (the last/top layer). Under the hood:
-`copilot-memory session stack {save,add,list,show,apply,rm}` (`--global` targets `_global`).
+`copilot-memory session stack {save,add,list,show,apply,refresh,rm}` (`--global` targets `_global`).
+
+**Auto-refresh (staleness).** `stack apply` fingerprints each source layer by its
+`lastUpdatedAt` at merge time (stored in the merged session's `sourceVersions`). A plain
+`stack show` always re-reads live layers so it's inherently fresh; a *materialized* stack can
+drift once a source layer is updated afterwards. `stack refresh --session <id>` detects this:
+with `--check` it only reports (exit `0` fresh, `1` stale), otherwise it rebuilds the merged
+session **in place** from the changed layers using the same merge engine. Snapshots applied
+before this feature have no fingerprint and report *unknown* — re-apply to enable checks.
 
 **Ref validation.** Diamonds are allowed (two layers may reuse the same sub-stack) while
 true cycles still raise. `stack save` **warns** (but does not block) on refs that don't

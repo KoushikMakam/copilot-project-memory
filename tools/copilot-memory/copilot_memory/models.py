@@ -83,6 +83,9 @@ class SessionEntry(BaseModel):
     compactedSummary: str = ""
     compactionCount: int = 0
     parents: list[str] = []
+    # Maps each layer ref (base→top) to its lastUpdatedAt at merge time, so a
+    # materialized stack can detect when a source layer has since changed.
+    sourceVersions: dict[str, str] = {}
 
     @field_validator("status")
     @classmethod

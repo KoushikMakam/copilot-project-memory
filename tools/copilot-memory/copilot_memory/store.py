@@ -883,6 +883,12 @@ def apply_stack(
     resolved = resolve_stack_entries(project_dir, session_ids)
     parents = [entry for _, entry in resolved]
     merged = build_merged_session(parents, new_session_id, now_iso_str)
+    # Fingerprint each layer (base→top) by its ref → lastUpdatedAt so a later
+    # read can detect whether any source layer has changed since this apply.
+    merged.sourceVersions = {
+        _layer_ref(project_dir, owner, entry): entry.lastUpdatedAt
+        for owner, entry in resolved
+    }
 
     target_dir = project_dir / "sessions" / (into_name or "_default")
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -894,6 +900,63 @@ def apply_stack(
         activeSession=into_name,
     ))
     return merged, target_path
+
+
+def stack_is_stale(
+    project_dir: Path,
+    merged: SessionEntry,
+) -> Optional[list[str]]:
+    """Report which source layers changed since a stack was materialized.
+
+    Compares each fingerprinted layer's recorded ``lastUpdatedAt`` against the
+    live session file. Returns:
+      - ``None``  if the merged session carries no fingerprint (pre-feature
+        snapshot) — staleness is *unknown*, so callers should treat it as such.
+      - ``[]``    if every layer is unchanged (fresh).
+      - ``[refs]`` the stale layer refs (base→top order) whose live version is
+        newer than what was merged, or whose source file has gone missing.
+    """
+    if not merged.sourceVersions:
+        return None
+    stale: list[str] = []
+    for ref, stored_version in merged.sourceVersions.items():
+        try:
+            pairs = resolve_stack_refs([ref], project_dir)
+        except ValueError:
+            stale.append(ref)
+            continue
+        for owner, sid in pairs:
+            path = find_session_file(owner, sid)
+            entry = load_session(path) if path else None
+            if entry is None or entry.lastUpdatedAt > stored_version:
+                stale.append(ref)
+                break
+    return stale
+
+
+def refresh_stack(
+    project_dir: Path,
+    merged: SessionEntry,
+    now_iso_str: str,
+    into_name: Optional[str] = None,
+) -> tuple[SessionEntry, Optional[Path], list[str]]:
+    """Re-materialize a stack in place if any source layer has changed.
+
+    Rebuilds from the fingerprinted layer refs (the flattened base→top list in
+    ``sourceVersions``) using the same ``apply_stack`` engine, overwriting the
+    existing merged session id. Returns ``(entry, path, stale_refs)``. When the
+    stack is fresh (or its staleness is unknown because it predates
+    fingerprinting), nothing is rewritten and ``(merged, None, [])`` is returned.
+    """
+    stale = stack_is_stale(project_dir, merged)
+    if not stale:
+        return merged, None, []
+    refs = list(merged.sourceVersions.keys())
+    rebuilt, path = apply_stack(
+        project_dir, refs, new_session_id=merged.sessionId,
+        now_iso_str=now_iso_str, into_name=into_name,
+    )
+    return rebuilt, path, stale
 
 
 def archive_closed_sessions(

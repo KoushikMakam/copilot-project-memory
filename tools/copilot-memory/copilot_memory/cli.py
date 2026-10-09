@@ -41,6 +41,8 @@ from copilot_memory.store import (
     archive_closed_sessions,
     assemble_stack,
     apply_stack,
+    refresh_stack,
+    stack_is_stale,
     check_session_integrity,
     check_stack_integrity,
     ensure_project_dir,
@@ -688,7 +690,39 @@ def cmd_session_stack(args: argparse.Namespace) -> int:
         print(f"  layers: {', '.join(merged.parents)}")
         return 0
 
-    print(f"{_c(YELLOW, 'Specify a stack action: list | save | rm | show | apply')}")
+    if action == "refresh":
+        sid = getattr(args, "session_id", None)
+        path = find_session_file(project_dir, sid) if sid else None
+        if path is None:
+            print(f"{_c(RED, '❌ Unknown session')} '{sid}'")
+            return 2
+        merged = load_session(path)
+        if merged is None:
+            print(f"{_c(RED, '❌ Could not load session')} '{sid}'")
+            return 2
+        stale = stack_is_stale(project_dir, merged)
+        if stale is None:
+            print(f"{_c(YELLOW, '⚠️  No layer fingerprint on this session')} "
+                  "(applied before auto-refresh existed) — re-apply the stack to enable staleness checks.")
+            return 2
+        if not stale:
+            print(f"{_c(GREEN, '✅ Stack is fresh')} — all {len(merged.sourceVersions)} layer(s) unchanged since apply.")
+            return 0
+        # Stale: --check only reports (exit 1); otherwise rebuild in place.
+        if getattr(args, "check", False):
+            print(f"{_c(YELLOW, f'⚠️  Stack stale — {len(stale)} layer(s) updated since apply:')}")
+            print(f"    {_c(DIM, ', '.join(stale))}")
+            return 1
+        rebuilt, new_path, changed = refresh_stack(
+            project_dir, merged, now_iso(),
+            into_name=getattr(args, "into", None),
+        )
+        print(f"{_c(GREEN, f'🔄 Refreshed stack — rebuilt from {len(changed)} updated layer(s):')}")
+        print(f"    {_c(DIM, ', '.join(changed))}")
+        print(f"  sessionId: {rebuilt.sessionId} → {new_path}")
+        return 0
+
+    print(f"{_c(YELLOW, 'Specify a stack action: list | save | rm | show | apply | refresh')}")
     return 2
 
 
@@ -971,6 +1005,16 @@ def main():
     ps_apply.add_argument("--into", help="Target named-session folder (default: _default)")
     ps_apply.add_argument("--new-id", dest="new_id", help="Explicit merged session ID")
     _add_cwd(ps_apply)
+
+    ps_refresh = stack_sub.add_parser(
+        "refresh",
+        help="Rebuild a materialized stack if any source layer changed since apply")
+    ps_refresh.add_argument("--session", dest="session_id", required=True,
+                            help="The materialized (applied) merged session ID to check/refresh")
+    ps_refresh.add_argument("--check", action="store_true",
+                            help="Only report staleness (exit 0 fresh, 1 stale); don't rebuild")
+    ps_refresh.add_argument("--into", help="Target named-session folder (default: _default)")
+    _add_cwd(ps_refresh)
 
     args = parser.parse_args()
 
