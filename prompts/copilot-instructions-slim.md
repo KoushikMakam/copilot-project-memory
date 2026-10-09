@@ -50,6 +50,7 @@ Files are YAML (rules.yml, preferences.yml, context.yml, tracking.yml) + JSON (s
 | `:stack add <name> <refs…>` | `copilot-memory session stack save <name> <refs…> --append` |
 | `:stack rm <name> [refs…]` | `copilot-memory session stack rm <name> [refs…]` (omit refs to delete the stack) |
 | `:stack apply <name>` | `copilot-memory session stack apply --stack <name>` (materialize as one merged session) |
+| `:stack refresh <id>` | `copilot-memory session stack refresh --session <id>` (rebuild if a layer changed; add `--check` to only report staleness) |
 | `:layer <refs…>` | `copilot-memory session stack show <refs…>` — ad-hoc pick-and-choose, no save |
 
 ### Layered Context (Stacks)
@@ -82,6 +83,9 @@ sessions living in other repos (a "multi-repo session").
   without saving; `:stack save <name> <refs…>` persists the selection for reuse.
 - **Materialize:** `:stack apply <name>` collapses the layers (even across repos) into one
   new merged session (records all layers under `parents`) so future auto-saves build on it.
+- **Refresh:** a materialized stack fingerprints each layer's `lastUpdatedAt` (in
+  `sourceVersions`). `:stack refresh <id>` rebuilds it when a source layer has changed since
+  apply (`--check` only reports: exit 0 fresh, 1 stale). A plain `:stack show` is always live.
 
 Resolution is recursive with cycle detection (diamonds allowed, true cycles raise). `stack show`
 previews the layered context using the same merge engine `stack apply` persists, so the preview

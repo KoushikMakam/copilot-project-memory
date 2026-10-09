@@ -418,3 +418,45 @@ class TestCmdSessionStackAndList:
              patch("copilot_memory.store.GLOBAL_DIR", gdir):
             assert cmd_session_stack(show) == 2
         assert "Unknown stack" in capsys.readouterr().out
+
+    def test_stack_refresh_check_and_rebuild(self, mock_memory, capsys):
+        from copilot_memory.cli import cmd_session_stack
+        from copilot_memory.store import _write_json, load_session, find_session_file
+        from types import SimpleNamespace
+        tmp_path, project_dir = mock_memory
+        gdir = tmp_path / "_global"
+
+        with patch("copilot_memory.cli.find_project_dir", return_value=project_dir), \
+             patch("copilot_memory.cli.GLOBAL_DIR", gdir), \
+             patch("copilot_memory.store.GLOBAL_DIR", gdir):
+            # Materialize a 1-layer stack from the mock session.
+            apply = SimpleNamespace(cwd=None, stack_action="apply", stack=None,
+                                    sids=["test-session-001"], into=None,
+                                    new_id="applied-cli")
+            assert cmd_session_stack(apply) == 0
+            capsys.readouterr()
+
+            # Fresh → --check exits 0.
+            check = SimpleNamespace(cwd=None, stack_action="refresh",
+                                    session_id="applied-cli", check=True, into=None)
+            assert cmd_session_stack(check) == 0
+            assert "fresh" in capsys.readouterr().out.lower()
+
+            # Bump the source layer so the materialized stack is now stale.
+            src = find_session_file(project_dir, "test-session-001")
+            data = load_session(src).model_dump()
+            data["lastUpdatedAt"] = "2099-01-01T00:00:00Z"
+            data["decisions"] = ["brand new decision"]
+            _write_json(src, data)
+
+            # Stale → --check exits 1.
+            assert cmd_session_stack(check) == 1
+            assert "stale" in capsys.readouterr().out.lower()
+
+            # Rebuild → exits 0 and picks up the new decision.
+            refresh = SimpleNamespace(cwd=None, stack_action="refresh",
+                                      session_id="applied-cli", check=False, into=None)
+            assert cmd_session_stack(refresh) == 0
+            assert "Refreshed" in capsys.readouterr().out
+            rebuilt = load_session(find_session_file(project_dir, "applied-cli"))
+            assert "brand new decision" in rebuilt.decisions

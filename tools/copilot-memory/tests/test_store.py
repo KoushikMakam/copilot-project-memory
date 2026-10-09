@@ -802,6 +802,94 @@ class TestSessionStack:
         assert any("ghost" in p for p in problems)
         assert all("real (unresolvable)" not in p for p in problems)
 
+    # --- Auto-refresh: fingerprint source layers at apply, detect staleness ---
+    def test_apply_records_source_version_fingerprint(self, tmp_project):
+        from copilot_memory.store import apply_stack
+
+        self._write(tmp_project, self._mk("base", lastUpdatedAt="2026-06-01T00:00:00Z"))
+        self._write(tmp_project, self._mk("top", lastUpdatedAt="2026-06-02T00:00:00Z"))
+        merged, _ = apply_stack(
+            tmp_project, ["base", "top"],
+            new_session_id="applied-fp", now_iso_str="2026-06-10T00:00:00Z")
+        assert merged.sourceVersions == {
+            "base": "2026-06-01T00:00:00Z",
+            "top": "2026-06-02T00:00:00Z",
+        }
+
+    def test_stack_is_stale_fresh_returns_empty(self, tmp_project):
+        from copilot_memory.store import apply_stack, stack_is_stale
+
+        self._write(tmp_project, self._mk("base"))
+        self._write(tmp_project, self._mk("top"))
+        merged, _ = apply_stack(
+            tmp_project, ["base", "top"],
+            new_session_id="applied-fresh", now_iso_str="2026-06-10T00:00:00Z")
+        assert stack_is_stale(tmp_project, merged) == []
+
+    def test_stack_is_stale_detects_updated_layer(self, tmp_project):
+        from copilot_memory.store import apply_stack, stack_is_stale
+
+        self._write(tmp_project, self._mk("base", lastUpdatedAt="2026-06-01T00:00:00Z"))
+        self._write(tmp_project, self._mk("top", lastUpdatedAt="2026-06-01T00:00:00Z"))
+        merged, _ = apply_stack(
+            tmp_project, ["base", "top"],
+            new_session_id="applied-stale", now_iso_str="2026-06-10T00:00:00Z")
+        # A source layer moves on after the apply.
+        self._write(tmp_project, self._mk(
+            "top", decisions=["new work"], lastUpdatedAt="2026-06-15T00:00:00Z"))
+        assert stack_is_stale(tmp_project, merged) == ["top"]
+
+    def test_stack_is_stale_flags_missing_layer(self, tmp_project):
+        from copilot_memory.store import apply_stack, stack_is_stale
+
+        self._write(tmp_project, self._mk("base"))
+        self._write(tmp_project, self._mk("gone"))
+        merged, _ = apply_stack(
+            tmp_project, ["base", "gone"],
+            new_session_id="applied-miss", now_iso_str="2026-06-10T00:00:00Z")
+        (tmp_project / "sessions" / "_default" / "gone.json").unlink()
+        assert stack_is_stale(tmp_project, merged) == ["gone"]
+
+    def test_stack_is_stale_unknown_for_pre_feature_snapshot(self, tmp_project):
+        from copilot_memory.store import stack_is_stale
+
+        legacy = self._mk("legacy-merged", parents=["base", "top"])
+        assert legacy.sourceVersions == {}
+        assert stack_is_stale(tmp_project, legacy) is None
+
+    def test_refresh_stack_rebuilds_when_stale(self, tmp_project):
+        from copilot_memory.store import apply_stack, refresh_stack, load_session
+
+        self._write(tmp_project, self._mk("base", decisions=["b-old"]))
+        self._write(tmp_project, self._mk("top", decisions=["t-old"]))
+        merged, path = apply_stack(
+            tmp_project, ["base", "top"],
+            new_session_id="applied-rb", now_iso_str="2026-06-10T00:00:00Z")
+        assert "t-new" not in merged.decisions
+
+        self._write(tmp_project, self._mk(
+            "top", decisions=["t-old", "t-new"], lastUpdatedAt="2026-06-20T00:00:00Z"))
+
+        rebuilt, new_path, stale = refresh_stack(
+            tmp_project, merged, "2026-06-21T00:00:00Z")
+        assert stale == ["top"]
+        assert rebuilt.sessionId == "applied-rb"       # rebuilt in place
+        assert "t-new" in rebuilt.decisions
+        # Fingerprint re-stamped, so it is now fresh again.
+        assert load_session(new_path).sourceVersions["top"] == "2026-06-20T00:00:00Z"
+
+    def test_refresh_stack_noop_when_fresh(self, tmp_project):
+        from copilot_memory.store import apply_stack, refresh_stack
+
+        self._write(tmp_project, self._mk("base"))
+        merged, _ = apply_stack(
+            tmp_project, ["base"],
+            new_session_id="applied-noop", now_iso_str="2026-06-10T00:00:00Z")
+        rebuilt, path, stale = refresh_stack(tmp_project, merged, "2026-06-11T00:00:00Z")
+        assert stale == []
+        assert path is None
+        assert rebuilt is merged
+
 
 
 
